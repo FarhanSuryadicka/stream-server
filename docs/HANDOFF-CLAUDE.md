@@ -36,6 +36,14 @@ mengukur serta menampilkan:
 Kotlin/Compose adalah UI dan USB-permission glue. Capture, decode, H.264 encode,
 transport, serta instrumentation utama berada di native C/C++.
 
+### Instruksi prioritas terbaru
+
+Baca juga `docs/FUTURE-SERVER-ARCHITECTURE.md`. Dokumen tersebut hanya mencatat
+arah arsitektur masa depan (mobile edge processing dan control-room server
+C++). **Jangan mulai membuat atau memigrasikan server ke C++ sampai user
+memberikan perintah eksplisit.** Prioritas aktif tetap menyelesaikan protokol,
+validasi fisik, pengukuran, dan komparasi dengan harness yang sekarang.
+
 ## 3. Konfigurasi jaringan terakhir
 
 ```text
@@ -348,4 +356,3 @@ receiver, preview, dan metriknya sudah tersedia.
 - Perbandingan one-way latency di bawah sekitar 5 ms tidak resolvable secara
   kuat karena residual clock-sync error.
 - Pertahankan `AGENTS.md` dan `CLAUDE.md` sinkron jika salah satunya diubah.
-
