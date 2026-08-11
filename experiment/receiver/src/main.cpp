@@ -60,7 +60,10 @@ void PrintUsage(const char* argv0) {
       "Usage: %s --phone <ip> [options]\n"
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
-      "  --protocol <name>     raw_udp | rtp_udp | srt | mjpeg  (default: raw_udp)\n"
+      "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg\n"
+      "                        (default: raw_udp. rtsp receives the same RTP\n"
+      "                         packets as rtp_udp; only the sender differs,\n"
+      "                         so the run records which one was used.)\n"
       "  --video-port <n>      Video port      (default: protocol default)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
@@ -121,6 +124,10 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     o->video_port = UCV_PORT_RTP;
   if (o->protocol == "srt" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_SRT;
+  // RTSP signalling carries the very same RTP packets, so the media still
+  // arrives on the RTP port and is parsed by the RTP path below.
+  if (o->protocol == "rtsp" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_RTP;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -659,11 +666,17 @@ int main(int argc, char** argv) {
                 sync_before.offset_ns,
                 sync_before.best_rtt_ns);
 
+  // RTSP signalling carries plain RTP packets, so every RTP-shaped code path
+  // below must accept it too. One predicate rather than a string comparison
+  // repeated at each site, so a missed site cannot silently mis-parse.
+  const bool rtp_wire = opt.protocol == "rtp_udp" || opt.protocol == "rtsp";
+
   ucv::UdpSocket video;
   ucv::UdpSender preview;
   MjpegReader mjpeg;
   SrtReceiver srt;
-  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp") {
+  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
+      opt.protocol == "rtsp") {
     if (!video.Bind(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot bind UDP :%d\n", opt.video_port);
       return 1;
@@ -714,7 +727,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
-        (opt.protocol == "rtp_udp" ? UCV_PROTO_RTSP :
+        (rtp_wire ? UCV_PROTO_RTSP :
          (opt.protocol == "srt" ? UCV_PROTO_SRT : UCV_PROTO_RAWUDP));
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
@@ -872,7 +885,7 @@ int main(int argc, char** argv) {
     ucv_frame_header_t h;
     Reassembler::Complete f;
     int assembled = 0;
-    if (opt.protocol == "rtp_udp") {
+    if (rtp_wire) {
       assembled = rtp_reasm.Push(buf.data(), static_cast<size_t>(n), t_recv,
                                  expected_run_hash, &h, &f);
       if (assembled == -2) { wrong_run++; continue; }
@@ -916,7 +929,7 @@ int main(int argc, char** argv) {
 
     bytes_wire += static_cast<uint64_t>(n);
 
-    if (opt.protocol == "rtp_udp") {
+    if (rtp_wire) {
       if (!assembled) continue;
     } else {
       const uint8_t* chunk = buf.data() + UCV_FRAME_HEADER_SIZE;
@@ -1038,8 +1051,9 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(bad_header),
               static_cast<unsigned long long>(wrong_run));
 
-  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp") {
-    const char* packet_name = opt.protocol == "rtp_udp" ? "RTP" : "UDP";
+  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
+      opt.protocol == "rtsp") {
+    const char* packet_name = rtp_wire ? "RTP" : "UDP";
     std::printf("  %s packets recv   %llu\n"
                 "  %s packets lost   %llu (%.3f %%)\n"
                 "  packet reorder     %llu\n"
@@ -1128,7 +1142,7 @@ int main(int argc, char** argv) {
               "  • True wire overhead needs a packet capture; the figure above\n"
               "    counts application bytes only and cannot see retransmits.\n");
 
-  const bool udp_protocol = opt.protocol == "raw_udp" || opt.protocol == "rtp_udp";
+  const bool udp_protocol = opt.protocol == "raw_udp" || rtp_wire;
   const uint64_t summary_packets_received = opt.protocol == "srt"
       ? srt_received : (udp_protocol ? packets.received() : tcp_segments);
   const uint64_t summary_packets_lost = opt.protocol == "srt"

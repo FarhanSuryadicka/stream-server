@@ -58,4 +58,10 @@ object UvcNative {
     const val PROTO_MJPEG = 5
     const val PROTO_RTMPS = 6
     const val PROTO_HLS = 7
+
+    // RTSP with real signalling (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN). It puts
+    // the same RTP packets on the wire as PROTO_RTSP, which is the bare RTP data
+    // plane started out-of-band — the two are separate ids so a run records
+    // which one actually carried it.
+    const val PROTO_RTSP_SIGNALLED = 8
 }

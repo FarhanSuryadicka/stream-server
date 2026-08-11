@@ -177,7 +177,7 @@ class PreviewPipeline:
         udp.settimeout(0.5)
         port = int(udp.getsockname()[1])
         process = None
-        if protocol in ("raw_udp", "rtp_udp", "srt"):
+        if protocol in ("raw_udp", "rtp_udp", "rtsp", "srt"):
             ffmpeg = self._find_ffmpeg()
             if not ffmpeg:
                 udp.close()
@@ -425,7 +425,7 @@ class DashboardState:
         duration = max(10, min(3600, int(request.get("duration", 60))))
         warmup = max(0, min(duration - 1, int(request.get("warmup", 5))))
         protocol = str(request.get("protocol", "raw_udp"))
-        if protocol not in ("raw_udp", "rtp_udp", "srt", "mjpeg"):
+        if protocol not in ("raw_udp", "rtp_udp", "rtsp", "srt", "mjpeg"):
             raise ValueError("protocol belum diimplementasikan")
 
         with self.lock:
@@ -641,7 +641,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
     if protocol == "raw_udp" and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "udp_packets"
-    elif protocol == "rtp_udp" and packets_received + packets_lost:
+    elif protocol in ("rtp_udp", "rtsp") and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "rtp_packets"
     elif protocol == "srt" and packets_received + packets_lost:

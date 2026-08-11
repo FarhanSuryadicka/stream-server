@@ -238,7 +238,16 @@ ucv_transport_t *ucv_transport_get(ucv_protocol_t proto) {
 
 /* Weak stubs for the library-backed transports. Each is replaced by a real
  * implementation when its library is vendored in; see
- * experiment/docs/03-implementation-plan.md. */
+ * experiment/docs/03-implementation-plan.md.
+ *
+ * WebRTC is the one that is still genuinely blocked, and not for want of
+ * writing code: it mandates DTLS-SRTP, and no DTLS, SRTP, ICE or SCTP library
+ * is vendored here (SRT's haicrypt is only a shim over mbedTLS/OpenSSL, and the
+ * SRT build has ENABLE_ENCRYPTION off). Sending plaintext RTP and labelling the
+ * run "webrtc" would be exactly the mislabelling this registry exists to
+ * prevent, so it keeps returning NULL until libdatachannel + a crypto backend
+ * are vendored — a decision with real repository-size and licence consequences,
+ * so it is the maintainer's to make. */
 __attribute__((weak)) ucv_transport_t *ucv_transport_srt(void)    { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_rtsp(void)   { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_rtsp_signalled(void) { return NULL; }
