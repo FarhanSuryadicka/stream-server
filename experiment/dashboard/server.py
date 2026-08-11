@@ -707,7 +707,12 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         "duplicates": int(summary.get("duplicates", 0)),
         "reassembly_failures": int(summary.get("reassembly_failures", 0)),
         "goodput_mbps": round(8.0 * payload / duration_s / 1e6, 3) if duration_s > 0 else 0.0,
-        "overhead_pct": round(100.0 * (wire - payload) / payload, 3) if payload else 0.0,
+        # None, not a number, when the protocol reports no wire total at all.
+        # WebRTC's RTP/SRTP/SCTP framing sits below libdatachannel's frame API,
+        # so wire is 0 there and the subtraction would claim -100 % overhead —
+        # a measurement that was never taken, printed as if it were one.
+        "overhead_pct": (round(100.0 * (wire - payload) / payload, 3)
+                         if payload and wire else None),
         "control": control,
         "parse_errors": parse_errors,
     }
