@@ -190,6 +190,7 @@ add_library(uvcserver SHARED
     ucv_transport_rtp.c
     ucv_transport_rtsp.c
     ucv_transport_hls.c
+    ucv_transport_rtmp.c
     ucv_transport_srt.c
     ucv_control.c
     ucv_encoder.c
