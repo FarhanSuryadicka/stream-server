@@ -361,6 +361,11 @@ uint64_t ucv_encoder_drops(const ucv_encoder_t *e)      { return e ? e->drops : 
 
 /* Host smoke tests compile this file with UCV_JPEG_ONLY. Keep the decoder
  * implementation identical to Android while replacing only its log sink. */
+#define ELOG_BOTH(...)             \
+  do {                             \
+    fprintf(stdout, __VA_ARGS__);  \
+    fputc('\n', stdout);           \
+  } while (0)
 #define ELOGE_BOTH(...)            \
   do {                             \
     fprintf(stderr, __VA_ARGS__);  \
@@ -381,11 +386,16 @@ struct jpeg_err_ctx {
   jmp_buf               jump;
 };
 
+#define UCV_JPEG_COMPONENTS 3
+#define UCV_JPEG_RAW_ROWS   (MAX_SAMP_FACTOR * DCTSIZE)
+
 struct ucv_jpeg_decoder {
   int      width, height;
   uint8_t *nv12;      /* Y plane, then interleaved UV (NV12 order) */
   size_t   nv12_size;
-  uint8_t *rgb_row;   /* one scanline of YCbCr scratch */
+  size_t   raw_stride;
+  uint8_t *raw[UCV_JPEG_COMPONENTS];
+  JSAMPROW raw_rows[UCV_JPEG_COMPONENTS][UCV_JPEG_RAW_ROWS];
 
   /* Creating and destroying libjpeg's permanent pools for every camera frame
    * is pure allocator overhead. This object is owned by the single capture
@@ -393,6 +403,7 @@ struct ucv_jpeg_decoder {
   struct jpeg_decompress_struct cinfo;
   struct jpeg_err_ctx           err;
   int                           jpeg_created;
+  int                           layout_logged;
 };
 
 static void jpeg_error_exit_longjmp(j_common_ptr cinfo) {
@@ -421,12 +432,22 @@ ucv_jpeg_decoder_t *ucv_jpeg_decoder_create(int width, int height) {
   d->height = height;
   d->nv12_size = (size_t)width * height * 3 / 2;
   d->nv12 = (uint8_t *)malloc(d->nv12_size);
-  d->rgb_row = (uint8_t *)malloc((size_t)width * 3);
-  if (!d->nv12 || !d->rgb_row) {
+  if (!d->nv12) {
     ucv_jpeg_decoder_destroy(d);
     return NULL;
   }
-
+  d->raw_stride = ((size_t)width + DCTSIZE - 1) / DCTSIZE * DCTSIZE;
+  const size_t raw_bytes = d->raw_stride * UCV_JPEG_RAW_ROWS;
+  for (int component = 0; component < UCV_JPEG_COMPONENTS; component++) {
+    d->raw[component] = (uint8_t *)malloc(raw_bytes);
+    if (!d->raw[component]) {
+      ucv_jpeg_decoder_destroy(d);
+      return NULL;
+    }
+    for (int row = 0; row < UCV_JPEG_RAW_ROWS; row++)
+      d->raw_rows[component][row] =
+          d->raw[component] + (size_t)row * d->raw_stride;
+  }
   d->cinfo.err = jpeg_std_error(&d->err.pub);
   d->err.pub.error_exit = jpeg_error_exit_longjmp;
   d->err.pub.output_message = jpeg_output_message_silent;
@@ -448,14 +469,41 @@ void ucv_jpeg_decoder_destroy(ucv_jpeg_decoder_t *d) {
   if (d->jpeg_created)
     jpeg_destroy_decompress(&d->cinfo);
   free(d->nv12);
-  free(d->rgb_row);
+  for (int component = 0; component < UCV_JPEG_COMPONENTS; component++)
+    free(d->raw[component]);
   free(d);
+}
+
+static int jpeg_raw_layout(const struct jpeg_decompress_struct *cinfo,
+                           int *h_expand, int *v_expand) {
+  if (cinfo->jpeg_color_space == JCS_GRAYSCALE && cinfo->num_components == 1) {
+    *h_expand = *v_expand = 0;
+    return 1;
+  }
+  if (cinfo->jpeg_color_space != JCS_YCbCr || cinfo->num_components != 3)
+    return 0;
+
+  const jpeg_component_info *y = &cinfo->comp_info[0];
+  const jpeg_component_info *cb = &cinfo->comp_info[1];
+  const jpeg_component_info *cr = &cinfo->comp_info[2];
+  if (y->h_samp_factor != cinfo->max_h_samp_factor ||
+      y->v_samp_factor != cinfo->max_v_samp_factor ||
+      cb->h_samp_factor != cr->h_samp_factor ||
+      cb->v_samp_factor != cr->v_samp_factor ||
+      cb->h_samp_factor <= 0 || cb->v_samp_factor <= 0 ||
+      cinfo->max_h_samp_factor % cb->h_samp_factor != 0 ||
+      cinfo->max_v_samp_factor % cb->v_samp_factor != 0)
+    return 0;
+
+  *h_expand = cinfo->max_h_samp_factor / cb->h_samp_factor;
+  *v_expand = cinfo->max_v_samp_factor / cb->v_samp_factor;
+  return 1;
 }
 
 int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
                             size_t jpeg_size, const uint8_t **out_nv12,
                             size_t *out_size) {
-  if (!d || !jpeg || !jpeg_size)
+  if (!d || !jpeg || !jpeg_size || !out_nv12 || !out_size)
     return -1;
 
   struct jpeg_decompress_struct *cinfo = &d->cinfo;
@@ -473,10 +521,17 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
     return -1;
   }
 
-  /* Ask libjpeg for YCbCr directly: the encoder wants luma/chroma, so going
-   * via RGB would mean two colour conversions per frame for nothing. */
-  cinfo->out_color_space = JCS_YCbCr;
-  cinfo->raw_data_out = FALSE;
+  int h_expand = 0, v_expand = 0;
+  if (!jpeg_raw_layout(cinfo, &h_expand, &v_expand)) {
+    ELOGE_BOTH("jpeg decoder: unsupported color space or sampling layout");
+    jpeg_abort_decompress(cinfo);
+    return -1;
+  }
+
+  /* Bypass libjpeg's chroma upsampler and interleaved YCbCr scanline output.
+   * The camera's native component planes are copied/resampled directly into
+   * NV12, eliminating the former 3-bytes-per-pixel scratch path. */
+  cinfo->raw_data_out = TRUE;
   jpeg_start_decompress(cinfo);
 
   if ((int)cinfo->output_width != d->width ||
@@ -487,35 +542,60 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
     jpeg_abort_decompress(cinfo);
     return -1;
   }
+  if (!d->layout_logged) {
+    if (cinfo->jpeg_color_space == JCS_GRAYSCALE)
+      ELOG_BOTH("jpeg decoder: raw grayscale -> NV12");
+    else
+      ELOG_BOTH("jpeg decoder: raw YCbCr -> NV12 (chroma scale %dx%d)",
+                 h_expand, v_expand);
+    d->layout_logged = 1;
+  }
 
   const int w = d->width, h = d->height;
   uint8_t *Y = d->nv12;
   uint8_t *UV = d->nv12 + (size_t)w * h;
-  JSAMPROW row = (JSAMPROW)d->rgb_row; /* 3 bytes/px: Y, Cb, Cr */
+  const JDIMENSION lines_per_iMCU =
+      (JDIMENSION)cinfo->max_v_samp_factor * DCTSIZE;
+  JSAMPARRAY planes[UCV_JPEG_COMPONENTS] = {
+      d->raw_rows[0], d->raw_rows[1], d->raw_rows[2]};
+
+  for (int component = 0; component < cinfo->num_components; component++) {
+    if ((size_t)cinfo->comp_info[component].width_in_blocks * DCTSIZE >
+        d->raw_stride) {
+      ELOGE_BOTH("jpeg decoder: raw component exceeds scratch stride");
+      jpeg_abort_decompress(cinfo);
+      return -1;
+    }
+  }
 
   while ((int)cinfo->output_scanline < h) {
-    const int y = (int)cinfo->output_scanline;
-    if (jpeg_read_scanlines(cinfo, &row, 1) != 1)
-      break;
+    const int y_base = (int)cinfo->output_scanline;
+    if (jpeg_read_raw_data(cinfo, planes, lines_per_iMCU) == 0) {
+      jpeg_abort_decompress(cinfo);
+      return -1;
+    }
+    const int rows = h - y_base < (int)lines_per_iMCU
+        ? h - y_base : (int)lines_per_iMCU;
 
-    uint8_t *yrow = Y + (size_t)y * w;
-    for (int x = 0; x < w; x++)
-      yrow[x] = row[x * 3 + 0];
+    for (int row = 0; row < rows; row++)
+      memcpy(Y + (size_t)(y_base + row) * w, d->raw_rows[0][row], (size_t)w);
 
-    /* NV12 chroma is 2x2 subsampled and interleaved U-then-V — that is what
-     * COLOR_FormatYUV420SemiPlanar means. Writing V first would be NV21,
-     * which encodes and transmits perfectly and simply comes out with the
-     * colours swapped, so it would look like a camera fault rather than a
-     * bug here.
-     *
-     * Sampled from even rows/columns rather than averaged: this is a
-     * measurement rig, and averaging would add per-pixel cost to the very
-     * encode path being timed. */
-    if ((y & 1) == 0) {
-      uint8_t *uvrow = UV + (size_t)(y / 2) * w;
+    for (int row = 0; row < rows; row++) {
+      const int output_y = y_base + row;
+      if (output_y & 1)
+        continue;
+      uint8_t *uv = UV + (size_t)(output_y / 2) * w;
+      if (cinfo->jpeg_color_space == JCS_GRAYSCALE) {
+        memset(uv, 128, (size_t)w);
+        continue;
+      }
+
+      const uint8_t *cb = d->raw_rows[1][row / v_expand];
+      const uint8_t *cr = d->raw_rows[2][row / v_expand];
       for (int x = 0; x < w; x += 2) {
-        uvrow[x + 0] = row[x * 3 + 1]; /* U (Cb) */
-        uvrow[x + 1] = row[x * 3 + 2]; /* V (Cr) */
+        const int source_x = x / h_expand;
+        uv[x + 0] = cb[source_x];
+        uv[x + 1] = cr[source_x];
       }
     }
   }

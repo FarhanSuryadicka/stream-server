@@ -3,7 +3,8 @@
 // This is worth testing on the PC because a colour-conversion bug does not
 // crash — it produces a stream that encodes and transmits perfectly and looks
 // wrong, which would be blamed on the protocol under test. The conversion
-// arithmetic here mirrors ucv_jpeg_decode_to_nv12() in ucv_encoder.c.
+// arithmetic here verifies the NV12 layout policy. ucv-jpegtest separately
+// compiles and exercises the production decoder against real JPEG input.
 //
 // Build: g++ -std=c++17 -O2 -Iinclude src/nv12test.cpp -o nv12test
 
@@ -37,8 +38,9 @@ struct Nv12 {
   size_t size() const { return data.size(); }
 };
 
-// Mirrors the scanline loop in ucv_jpeg_decode_to_nv12: libjpeg emits
-// JCS_YCbCr as 3 interleaved bytes per pixel (Y, Cb, Cr).
+// Models the 4:4:4 -> NV12 point-sampling policy: retain every Y sample and
+// take chroma from even rows/columns. The production raw-plane paths for
+// 4:2:0/4:2:2/4:4:4 are covered by ucv-jpegtest.
 void ConvertYCbCrToNv12(const std::vector<uint8_t>& ycbcr, Nv12* out) {
   const int w = out->w, h = out->h;
   uint8_t* Y = out->Y();

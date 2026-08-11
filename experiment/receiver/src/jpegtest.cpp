@@ -22,8 +22,10 @@ static int g_failures = 0;
     else         { std::printf("  ok  : %s\n", msg); }              \
   } while (0)
 
-static std::vector<uint8_t> MakeGrayJpeg(int width, int height,
-                                         uint8_t value) {
+static std::vector<uint8_t> MakeSolidJpeg(int width, int height,
+                                          uint8_t red, uint8_t green,
+                                          uint8_t blue, int y_h_samp = 2,
+                                          int y_v_samp = 2) {
   jpeg_compress_struct cinfo{};
   jpeg_error_mgr error{};
   cinfo.err = jpeg_std_error(&error);
@@ -37,10 +39,52 @@ static std::vector<uint8_t> MakeGrayJpeg(int width, int height,
   cinfo.input_components = 3;
   cinfo.in_color_space = JCS_RGB;
   jpeg_set_defaults(&cinfo);
+  cinfo.comp_info[0].h_samp_factor = y_h_samp;
+  cinfo.comp_info[0].v_samp_factor = y_v_samp;
+  cinfo.comp_info[1].h_samp_factor = 1;
+  cinfo.comp_info[1].v_samp_factor = 1;
+  cinfo.comp_info[2].h_samp_factor = 1;
+  cinfo.comp_info[2].v_samp_factor = 1;
   jpeg_set_quality(&cinfo, 90, TRUE);
   jpeg_start_compress(&cinfo, TRUE);
 
-  std::vector<uint8_t> row(static_cast<size_t>(width) * 3, value);
+  std::vector<uint8_t> row(static_cast<size_t>(width) * 3);
+  for (int x = 0; x < width; ++x) {
+    row[static_cast<size_t>(x) * 3 + 0] = red;
+    row[static_cast<size_t>(x) * 3 + 1] = green;
+    row[static_cast<size_t>(x) * 3 + 2] = blue;
+  }
+  while (cinfo.next_scanline < cinfo.image_height) {
+    JSAMPROW rows[] = {row.data()};
+    jpeg_write_scanlines(&cinfo, rows, 1);
+  }
+  jpeg_finish_compress(&cinfo);
+
+  std::vector<uint8_t> result(encoded, encoded + encoded_size);
+  std::free(encoded);
+  jpeg_destroy_compress(&cinfo);
+  return result;
+}
+
+static std::vector<uint8_t> MakeGrayscaleJpeg(int width, int height,
+                                               uint8_t value) {
+  jpeg_compress_struct cinfo{};
+  jpeg_error_mgr error{};
+  cinfo.err = jpeg_std_error(&error);
+  jpeg_create_compress(&cinfo);
+
+  unsigned char* encoded = nullptr;
+  unsigned long encoded_size = 0;
+  jpeg_mem_dest(&cinfo, &encoded, &encoded_size);
+  cinfo.image_width = static_cast<JDIMENSION>(width);
+  cinfo.image_height = static_cast<JDIMENSION>(height);
+  cinfo.input_components = 1;
+  cinfo.in_color_space = JCS_GRAYSCALE;
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, 90, TRUE);
+  jpeg_start_compress(&cinfo, TRUE);
+
+  std::vector<uint8_t> row(static_cast<size_t>(width), value);
   while (cinfo.next_scanline < cinfo.image_height) {
     JSAMPROW rows[] = {row.data()};
     jpeg_write_scanlines(&cinfo, rows, 1);
@@ -72,11 +116,65 @@ static void TestCreateGuards() {
         "odd height is rejected for NV12");
 }
 
+static void TestRawSubsamplingLayouts() {
+  std::printf("\n[jpeg] raw Y/Cb/Cr planes must map to NV12 for camera layouts\n");
+  constexpr int kWidth = 18;   // exercises right-edge DCT padding
+  constexpr int kHeight = 10;  // exercises a partial final iMCU row
+  ucv_jpeg_decoder_t* decoder =
+      ucv_jpeg_decoder_create(kWidth, kHeight);
+  CHECK(decoder != nullptr, "raw-layout decoder is created");
+  if (!decoder) return;
+
+  struct Layout { int h, v; const char* name; };
+  const Layout layouts[] = {
+      {2, 2, "4:2:0"}, {2, 1, "4:2:2"}, {1, 1, "4:4:4"}};
+  const uint8_t* first_buffer = nullptr;
+  for (const auto& layout : layouts) {
+    const auto jpeg = MakeSolidJpeg(kWidth, kHeight, 220, 40, 30,
+                                    layout.h, layout.v);
+    const uint8_t* nv12 = nullptr;
+    size_t size = 0;
+    const int rc = ucv_jpeg_decode_to_nv12(
+        decoder, jpeg.data(), jpeg.size(), &nv12, &size);
+    char message[128];
+    std::snprintf(message, sizeof(message), "%s raw planes decode", layout.name);
+    CHECK(rc == 0, message);
+    if (rc != 0) continue;
+    if (!first_buffer) first_buffer = nv12;
+    std::snprintf(message, sizeof(message), "%s reuses the NV12 buffer", layout.name);
+    CHECK(nv12 == first_buffer, message);
+
+    const uint8_t* uv = nv12 + static_cast<size_t>(kWidth) * kHeight;
+    uint64_t u_sum = 0, v_sum = 0;
+    for (size_t i = 0; i < static_cast<size_t>(kWidth) * kHeight / 2; i += 2) {
+      u_sum += uv[i];
+      v_sum += uv[i + 1];
+    }
+    std::snprintf(message, sizeof(message), "%s keeps U before V", layout.name);
+    CHECK(v_sum > u_sum + 40u * (kWidth * kHeight / 4), message);
+  }
+
+  const auto gray = MakeGrayscaleJpeg(kWidth, kHeight, 96);
+  const uint8_t* nv12 = nullptr;
+  size_t size = 0;
+  int rc = ucv_jpeg_decode_to_nv12(
+      decoder, gray.data(), gray.size(), &nv12, &size);
+  CHECK(rc == 0, "grayscale JPEG decodes through the raw path");
+  bool neutral_uv = rc == 0;
+  if (neutral_uv) {
+    const uint8_t* uv = nv12 + static_cast<size_t>(kWidth) * kHeight;
+    for (size_t i = 0; i < static_cast<size_t>(kWidth) * kHeight / 2; ++i)
+      if (uv[i] != 128) neutral_uv = false;
+  }
+  CHECK(neutral_uv, "grayscale JPEG produces neutral NV12 chroma");
+  ucv_jpeg_decoder_destroy(decoder);
+}
+
 static void TestPersistentDecodeAndRecovery() {
-  constexpr int kWidth = 16;
-  constexpr int kHeight = 16;
-  const auto valid = MakeGrayJpeg(kWidth, kHeight, 128);
-  const auto wrong_size = MakeGrayJpeg(kWidth * 2, kHeight, 128);
+  constexpr int kWidth = 18;
+  constexpr int kHeight = 10;
+  const auto valid = MakeSolidJpeg(kWidth, kHeight, 128, 128, 128);
+  const auto wrong_size = MakeSolidJpeg(kWidth * 2, kHeight, 128, 128, 128);
   const std::vector<uint8_t> corrupt = {
       0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
 
@@ -128,6 +226,7 @@ int main() {
   std::printf("Persistent JPEG decoder - host smoke test\n");
   std::printf("=========================================\n");
   TestCreateGuards();
+  TestRawSubsamplingLayouts();
   TestPersistentDecodeAndRecovery();
 
   std::printf("\n=========================================\n");
