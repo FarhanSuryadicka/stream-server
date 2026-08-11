@@ -91,10 +91,19 @@ X-UCV-Enc-Ns: 123456789112345
 X-UCV-Snd-Ns: 123456789122345
 X-UCV-Key: 1
 X-UCV-Run: 3735928559
+X-UCV-Net-Stats: 1
+X-UCV-TCP-Segments: 4821
+X-UCV-TCP-Retrans: 17
 ```
 
-Header text overhead (~130 B/frame) is counted in `wire_overhead_pct`, not
-excused.
+`X-UCV-TCP-Segments` and `X-UCV-TCP-Retrans` are connection-relative counters
+sampled from Android `TCP_INFO`. The receiver subtracts a second baseline after
+warmup and reports `retrans / (data_segments + retrans)` as the realtime TCP
+retransmission rate over all send attempts. This exposes network loss recovered
+by TCP; it is not final media loss.
+`X-UCV-Net-Stats: 0` means the kernel did not expose `TCP_INFO`, in which case
+the dashboard falls back to observed frame gaps instead of inventing a packet
+loss value. Header text overhead is counted in `wire_overhead_pct`, not excused.
 
 ---
 

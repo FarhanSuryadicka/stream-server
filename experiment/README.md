@@ -91,8 +91,8 @@ competing for isochronous USB bandwidth.
 - Clock synchronisation (SNTP-style, 64 probes, lowest-RTT wins)
 - Android: Raw UDP transport, instrumented MJPEG transport, control channel,
   encoder, pipeline — compiled into `libuvcserver.so`, symbols verified
-- PC: `ucv-receiver` — Raw UDP receive, reassembly, loss/reorder/jitter
-  accounting, control-RTT-under-load, NDJSON logging
+- PC: `ucv-receiver` — Raw UDP receive/reassembly, UDP packet loss, MJPEG/TCP
+  retransmission-rate, jitter accounting, control-RTT-under-load, NDJSON logging
 - `ucv-selftest` (34 checks) and `ucv-nv12test` — both passing
 - `ucv-mocksender` — phone stand-in; the whole path was validated end-to-end
   on one machine, including synthetic loss the receiver correctly reported
@@ -177,11 +177,12 @@ decides whether a protocol is usable at all.
   assumes a symmetric path; WiFi is not perfectly symmetric. Differences below
   ~5 ms between protocols are **not resolvable** by this harness. Sub-ms
   precision would need PTP hardware timestamping.
-- **Loss from sequence gaps is a lower bound.** A tail-end loss leaves no gap;
-  the true figure needs the sender's own frame count.
+- **Loss semantics follow the transport.** Raw UDP uses datagram sequence gaps;
+  MJPEG/TCP uses Android kernel retransmission counters. Frame gaps remain a
+  fallback only when transport counters are unavailable.
 - **Application-byte overhead is not wire overhead.** Retransmissions and
   header cost need a packet capture.
-- **UDP fragment indexing is implicit,** so a reordered fragment counts as a
-  reassembly failure. Recorded separately from true loss, never merged into it.
+- **UDP fragment indexing is explicit.** Packet sequence and fragment index/count
+  keep loss, reorder, duplicates, and reassembly failures as separate metrics.
 - **MJPEG carries JPEG, not H.264.** Its bandwidth numbers are not comparable
   to the other six by construction; its latency and control numbers are.

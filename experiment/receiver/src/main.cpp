@@ -156,6 +156,9 @@ class Reassembler {
     bool     keyframe;
     uint32_t run_hash = 0;
     uint32_t wire_bytes = 0;
+    uint64_t tcp_segments = 0;
+    uint64_t tcp_retrans = 0;
+    bool     tcp_stats = false;
     std::vector<uint8_t> payload;
   };
 
@@ -311,7 +314,8 @@ class MjpegReader {
           if (headers_end != std::string::npos) {
             const std::string headers = buffer_.substr(9, headers_end - 9);
             uint64_t length = 0, seq = 0, cap = 0, enc = 0, snd = 0;
-            uint64_t key = 0, run = 0;
+            uint64_t key = 0, run = 0, net_stats = 0;
+            uint64_t tcp_segments = 0, tcp_retrans = 0;
             if (!HeaderNumber(headers, "Content-Length", &length) ||
                 !HeaderNumber(headers, "X-UCV-Seq", &seq) ||
                 !HeaderNumber(headers, "X-UCV-Cap-Ns", &cap) ||
@@ -320,6 +324,11 @@ class MjpegReader {
                 !HeaderNumber(headers, "X-UCV-Key", &key) ||
                 !HeaderNumber(headers, "X-UCV-Run", &run) ||
                 length == 0 || length > 32 * 1024 * 1024) return -1;
+            const bool have_tcp_stats =
+                HeaderNumber(headers, "X-UCV-Net-Stats", &net_stats) &&
+                HeaderNumber(headers, "X-UCV-TCP-Segments", &tcp_segments) &&
+                HeaderNumber(headers, "X-UCV-TCP-Retrans", &tcp_retrans) &&
+                net_stats != 0;
             const size_t body = headers_end + 4;
             const size_t total = body + static_cast<size_t>(length) + 2;
             if (buffer_.size() >= total) {
@@ -332,6 +341,9 @@ class MjpegReader {
               out->keyframe = key != 0;
               out->run_hash = static_cast<uint32_t>(run);
               out->wire_bytes = static_cast<uint32_t>(total);
+              out->tcp_segments = tcp_segments;
+              out->tcp_retrans = tcp_retrans;
+              out->tcp_stats = have_tcp_stats;
               out->payload.assign(buffer_.begin() + body,
                                   buffer_.begin() + body + length);
               buffer_.erase(0, total);
@@ -547,6 +559,9 @@ int main(int argc, char** argv) {
 
   uint64_t bytes_payload = 0, bytes_wire = 0;
   uint64_t bad_header = 0, wrong_run = 0;
+  uint64_t tcp_segments = 0, tcp_retrans = 0;
+  uint64_t tcp_base_segments = 0, tcp_base_retrans = 0;
+  bool tcp_baseline = false, tcp_stats_available = false;
   const uint32_t expected_run_hash = ucv_run_id_hash(opt.run_id.c_str());
 
   const auto t_start   = std::chrono::steady_clock::now();
@@ -574,6 +589,16 @@ int main(int argc, char** argv) {
       if (std::chrono::steady_clock::now() < t_warmup) continue;
       if (!seq.Observe(f.seq)) continue;
 
+      if (f.tcp_stats) {
+        if (!tcp_baseline) {
+          tcp_base_segments = f.tcp_segments;
+          tcp_base_retrans = f.tcp_retrans;
+          tcp_baseline = true;
+        }
+        tcp_segments = f.tcp_segments - tcp_base_segments;
+        tcp_retrans = f.tcp_retrans - tcp_base_retrans;
+        tcp_stats_available = true;
+      }
       const double transport = (static_cast<int64_t>(f.t_recv_ns) +
                                 sync_before.offset_ns -
                                 static_cast<int64_t>(f.t_sent_ns)) / 1e6;
@@ -588,13 +613,17 @@ int main(int argc, char** argv) {
       bytes_payload += f.bytes;
       frames_in_window++;
       log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
-                     f.t_recv_ns, f.bytes, true, 0, 0);
+                     f.t_recv_ns, f.bytes, true,
+                     tcp_segments, tcp_retrans);
       const auto now = std::chrono::steady_clock::now();
       if (now - last_report >= std::chrono::seconds(5)) {
-        std::printf("[recv] %6llu MJPEG frames  transport p50=%.1f ms  jitter=%.2f ms  gaps=%llu\n",
+        const uint64_t tcp_attempts = tcp_segments + tcp_retrans;
+        const double tcp_loss = tcp_attempts
+            ? 100.0 * static_cast<double>(tcp_retrans) / tcp_attempts : 0.0;
+        std::printf("[recv] %6llu MJPEG frames  transport p50=%.1f ms  jitter=%.2f ms  tcp_retrans=%.3f%%\n",
                     static_cast<unsigned long long>(frames_in_window),
                     transport_ms.Percentile(0.50), jitter.jitter_ms(),
-                    static_cast<unsigned long long>(seq.gap_frames()));
+                    tcp_loss);
         last_report = now;
       }
       continue;
@@ -742,6 +771,16 @@ int main(int argc, char** argv) {
                 packets.loss_pct(),
                 static_cast<unsigned long long>(packets.reorder_events()),
                 static_cast<unsigned long long>(packets.duplicates()));
+  } else if (opt.protocol == "mjpeg") {
+    const uint64_t tcp_attempts = tcp_segments + tcp_retrans;
+    const double tcp_loss = tcp_attempts
+        ? 100.0 * static_cast<double>(tcp_retrans) / tcp_attempts : 0.0;
+    std::printf("  TCP data segments  %llu\n"
+                "  TCP retransmitted  %llu (%.3f %%)\n"
+                "  TCP_INFO status    %s\n",
+                static_cast<unsigned long long>(tcp_segments),
+                static_cast<unsigned long long>(tcp_retrans), tcp_loss,
+                tcp_stats_available ? "available" : "unavailable");
   }
 
   std::printf("\nJitter (RFC 3550)        [clock-offset independent]\n"
@@ -798,11 +837,16 @@ int main(int argc, char** argv) {
               "  • True wire overhead needs a packet capture; the figure above\n"
               "    counts application bytes only and cannot see retransmits.\n");
 
+  const uint64_t summary_packets_received = opt.protocol == "raw_udp"
+      ? packets.received()
+      : tcp_segments;
+  const uint64_t summary_packets_lost = opt.protocol == "raw_udp"
+      ? packets.missing() : tcp_retrans;
   log.WriteSummary(seq.received(), seq.gap_frames(), seq.reorder_events(),
                    seq.duplicates(), reasm.failures(), bytes_payload, bytes_wire,
                    have_after ? sync_after.offset_ns : 0, drift_ns,
                    clock_suspect || !have_after,
-                   packets.received(), packets.missing(),
+                   summary_packets_received, summary_packets_lost,
                    packets.reorder_events(), packets.duplicates());
   log.Close();
 

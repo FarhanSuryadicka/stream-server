@@ -606,7 +606,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         running_received += 1
         packet_received = int(frame.get("packets_received", 0))
         packet_lost = int(frame.get("packets_lost", 0))
-        if protocol == "raw_udp" and packet_received + packet_lost:
+        if protocol in ("raw_udp", "mjpeg") and packet_received + packet_lost:
             running_loss = 100.0 * packet_lost / (packet_received + packet_lost)
         else:
             running_loss = 100.0 * running_gaps / (running_received + running_gaps)
@@ -639,6 +639,9 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
     if protocol == "raw_udp" and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "udp_packets"
+    elif protocol == "mjpeg" and packets_received + packets_lost:
+        loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
+        loss_basis = "tcp_retransmissions"
     else:
         loss_pct = 100.0 * gaps / total_expected if total_expected else 0.0
         loss_basis = "frames"

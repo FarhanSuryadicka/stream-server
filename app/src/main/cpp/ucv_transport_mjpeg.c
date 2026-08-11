@@ -35,12 +35,30 @@
 typedef struct {
   int      lsock;
   int      clients[MJPEG_MAX_CLIENTS];
+  uint32_t tcp_base_segments[MJPEG_MAX_CLIENTS];
+  uint32_t tcp_base_retrans[MJPEG_MAX_CLIENTS];
   pthread_mutex_t lock;
   pthread_t accept_th;
   volatile int quit;
   int      started;
   int      port;
 } mjpeg_impl_t;
+
+static int tcp_counters(int s, uint32_t *segments, uint32_t *retrans) {
+#ifdef TCP_INFO
+  struct tcp_info info;
+  socklen_t size = sizeof(info);
+  memset(&info, 0, sizeof(info));
+  if (getsockopt(s, IPPROTO_TCP, TCP_INFO, &info, &size) == 0) {
+    *segments = info.tcpi_data_segs_out;
+    *retrans = info.tcpi_total_retrans;
+    return 1;
+  }
+#endif
+  *segments = 0;
+  *retrans = 0;
+  return 0;
+}
 
 static int send_all_fd(int s, const uint8_t *buf, size_t len) {
   size_t off = 0;
@@ -88,6 +106,8 @@ static void *mjpeg_accept_thread(void *arg) {
     for (int i = 0; i < MJPEG_MAX_CLIENTS; i++) {
       if (im->clients[i] < 0) {
         im->clients[i] = cs;
+        tcp_counters(cs, &im->tcp_base_segments[i],
+                     &im->tcp_base_retrans[i]);
         slot = i;
         break;
       }
@@ -113,8 +133,11 @@ static int mjpeg_start(ucv_transport_t *self, const char *cfg) {
   if (im->port <= 0)
     im->port = UCV_PORT_MJPEG;
 
-  for (int i = 0; i < MJPEG_MAX_CLIENTS; i++)
+  for (int i = 0; i < MJPEG_MAX_CLIENTS; i++) {
     im->clients[i] = -1;
+    im->tcp_base_segments[i] = 0;
+    im->tcp_base_retrans[i] = 0;
+  }
 
   im->lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (im->lsock < 0) {
@@ -156,33 +179,42 @@ static int mjpeg_send(ucv_transport_t *self, const ucv_encoded_frame_t *f) {
 
   /* Instrumentation headers (wire spec §1.2). t_sent is stamped here, right
    * before the writes, for the same reason as every other transport. */
-  uint64_t t_sent = ucv_now_ns();
-  char part[320];
-  int  pn = snprintf(part, sizeof(part),
-                     "--frame\r\n"
-                     "Content-Type: image/jpeg\r\n"
-                     "Content-Length: %zu\r\n"
-                     "X-UCV-Seq: %u\r\n"
-                     "X-UCV-Cap-Ns: %llu\r\n"
-                     "X-UCV-Enc-Ns: %llu\r\n"
-                     "X-UCV-Snd-Ns: %llu\r\n"
-                     "X-UCV-Key: %d\r\n"
-                     "X-UCV-Run: %u\r\n\r\n",
-                     f->size, f->seq,
-                     (unsigned long long)f->t_capture_ns,
-                     (unsigned long long)f->t_encoded_ns,
-                     (unsigned long long)t_sent,
-                     f->is_keyframe ? 1 : 0,
-                     ucv_get_run_id_hash());
-  if (pn < 0 || pn >= (int)sizeof(part))
-    return -EOVERFLOW;
-
   int delivered = 0;
   pthread_mutex_lock(&im->lock);
   for (int i = 0; i < MJPEG_MAX_CLIENTS; i++) {
     int s = im->clients[i];
     if (s < 0)
       continue;
+    uint32_t segments = 0, retrans = 0;
+    const int have_tcp_info = tcp_counters(s, &segments, &retrans);
+    const uint32_t segment_delta = segments - im->tcp_base_segments[i];
+    const uint32_t retrans_delta = retrans - im->tcp_base_retrans[i];
+    const uint64_t t_sent = ucv_now_ns();
+    char part[512];
+    int pn = snprintf(part, sizeof(part),
+                      "--frame\r\n"
+                      "Content-Type: image/jpeg\r\n"
+                      "Content-Length: %zu\r\n"
+                      "X-UCV-Seq: %u\r\n"
+                      "X-UCV-Cap-Ns: %llu\r\n"
+                      "X-UCV-Enc-Ns: %llu\r\n"
+                      "X-UCV-Snd-Ns: %llu\r\n"
+                      "X-UCV-Key: %d\r\n"
+                      "X-UCV-Run: %u\r\n"
+                      "X-UCV-Net-Stats: %d\r\n"
+                      "X-UCV-TCP-Segments: %u\r\n"
+                      "X-UCV-TCP-Retrans: %u\r\n\r\n",
+                      f->size, f->seq,
+                      (unsigned long long)f->t_capture_ns,
+                      (unsigned long long)f->t_encoded_ns,
+                      (unsigned long long)t_sent,
+                      f->is_keyframe ? 1 : 0,
+                      ucv_get_run_id_hash(), have_tcp_info,
+                      segment_delta, retrans_delta);
+    if (pn < 0 || pn >= (int)sizeof(part)) {
+      pthread_mutex_unlock(&im->lock);
+      return -EOVERFLOW;
+    }
     if (send_all_fd(s, (const uint8_t *)part, (size_t)pn) < 0 ||
         send_all_fd(s, f->data, f->size) < 0 ||
         send_all_fd(s, (const uint8_t *)"\r\n", 2) < 0) {

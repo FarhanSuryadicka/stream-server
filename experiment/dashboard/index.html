@@ -145,7 +145,7 @@
     $('validity').textContent=selectedRun.valid?'VALID RUN':selectedRun.clock_status;$('validity').className=selectedRun.valid?'ok':'bad';
     $('p50').textContent=f(selectedRun.transport.p50);$('p95').textContent=f(selectedRun.transport.p95);$('p99').textContent=f(selectedRun.transport.p99);
     $('jitter').textContent=f(selectedRun.jitter_ms);$('loss').textContent=f(selectedRun.loss_pct,3);$('goodput').textContent=f(selectedRun.goodput_mbps);
-    const packetLoss=selectedRun.loss_basis==='udp_packets';$('lossLabel').textContent=packetLoss?'Observed UDP packet loss':'Observed frame loss';$('lossChartTitle').textContent=packetLoss?'Observed UDP packet loss (%)':'Observed frame loss (%)';
+    const basis=selectedRun.loss_basis;const lossName=basis==='udp_packets'?'Observed UDP packet loss':basis==='tcp_retransmissions'?'TCP retransmission rate':'Observed frame loss';$('lossLabel').textContent=lossName;$('lossChartTitle').textContent=lossName+' (%)';
     // Show the group that belongs to THIS run. Keeping the previous run's text
     // in the field meant a Save label after switching runs (e.g. a new capture
     // mode) silently moved the label off the run it was written for, and the

@@ -423,7 +423,7 @@ layak dianggap sebagai pemenang karena residual error sinkronisasi sekitar
 Variasi perubahan waktu transit antarpaket/frame, dihitung dengan estimator
 RFC 3550. Jitter tidak bergantung pada offset clock absolut.
 
-### Observed packet loss
+### Network packet loss / retransmission
 
 Dihitung dari `packet_seq` unik pada setiap datagram Raw UDP:
 
@@ -432,8 +432,22 @@ loss % = missing UDP packets / expected UDP packets * 100
 ```
 
 Nilai diperbarui realtime dan mendeteksi satu fragmen yang hilang walaupun
-frame videonya tidak selesai. Untuk MJPEG/TCP, dashboard menampilkan observed
-frame loss karena retransmisi TCP tidak terlihat di level aplikasi.
+frame videonya tidak selesai.
+
+Untuk **MJPEG/TCP**, HP membaca `tcpi_data_segs_out` dan
+`tcpi_total_retrans` dari `TCP_INFO` socket yang sedang mengirim. Counter
+dikirim pada setiap frame dan receiver menghitung setelah warmup:
+
+```text
+TCP retransmission % = retransmitted segments /
+                       (data segments + retransmitted segments) * 100
+```
+
+Ini memperlihatkan loss jaringan yang dipulihkan oleh TCP dan sebelumnya
+terlihat sebagai `0%`. Namanya sengaja **TCP retransmission rate**, karena
+retransmission adalah bukti pemulihan transport, bukan frame akhir yang hilang.
+Jika perangkat tidak menyediakan `TCP_INFO`, dashboard jatuh kembali ke
+observed frame loss dan menandainya dengan label berbeda.
 
 ### Statistik lain yang tetap dicatat
 
