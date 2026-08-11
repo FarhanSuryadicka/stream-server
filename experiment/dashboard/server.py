@@ -425,7 +425,7 @@ class DashboardState:
         duration = max(10, min(3600, int(request.get("duration", 60))))
         warmup = max(0, min(duration - 1, int(request.get("warmup", 5))))
         protocol = str(request.get("protocol", "raw_udp"))
-        if protocol not in ("raw_udp", "rtp_udp", "rtsp", "srt", "mjpeg"):
+        if protocol not in ("raw_udp", "rtp_udp", "rtsp", "srt", "mjpeg", "hls"):
             raise ValueError("protocol belum diimplementasikan")
 
         with self.lock:

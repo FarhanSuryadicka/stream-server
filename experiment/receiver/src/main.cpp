@@ -20,12 +20,14 @@
 #include "ucv_log.h"
 #include <srt.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -60,10 +62,11 @@ void PrintUsage(const char* argv0) {
       "Usage: %s --phone <ip> [options]\n"
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
-      "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg\n"
+      "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg | hls\n"
       "                        (default: raw_udp. rtsp receives the same RTP\n"
       "                         packets as rtp_udp; only the sender differs,\n"
-      "                         so the run records which one was used.)\n"
+      "                         so the run records which one was used. hls\n"
+      "                         polls the phone's playlist over HTTP.)\n"
       "  --video-port <n>      Video port      (default: protocol default)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
@@ -128,6 +131,8 @@ bool ParseArgs(int argc, char** argv, Options* o) {
   // arrives on the RTP port and is parsed by the RTP path below.
   if (o->protocol == "rtsp" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_RTP;
+  if (o->protocol == "hls" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_HLS;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -521,6 +526,132 @@ class MjpegReader {
   bool response_done_ = false;
 };
 
+// HLS reader: the receiver is the CLIENT here, polling the phone's playlist and
+// pulling segments over HTTP. That is the opposite direction from every other
+// protocol in this harness, and it is exactly why HLS latency is measured in
+// seconds — a frame is not fetchable until its whole segment is sealed and the
+// playlist advertises it.
+//
+// HLS carries no per-frame metadata, so the sender writes a per-segment JSON
+// sidecar (implementation plan §8). Timestamps therefore stay per-frame and
+// fully comparable; only their DELIVERY is batched. t_recv is stamped when the
+// segment finishes downloading, which is the first instant any frame in it
+// could be decoded — attributing an earlier arrival to it would flatter HLS
+// against the streaming protocols.
+class HlsReader {
+ public:
+  bool Configure(const std::string& phone, int port) {
+    phone_ = phone;
+    port_ = port;
+    return true;
+  }
+
+  // Returns the number of frames appended to `out`, or -1 on a fatal error.
+  int Poll(std::vector<Reassembler::Complete>* out, int timeout_ms) {
+    std::string playlist;
+    if (!HttpGet("/live.m3u8", &playlist, timeout_ms)) return 0;
+
+    // Segment indices are taken from the playlist rather than counted locally:
+    // if the window slid past one we missed, the gap must show up as loss, not
+    // be silently renumbered.
+    std::vector<uint32_t> wanted;
+    size_t pos = 0;
+    while ((pos = playlist.find("seg", pos)) != std::string::npos) {
+      uint32_t index = 0;
+      if (std::sscanf(playlist.c_str() + pos, "seg%u.ts", &index) == 1) {
+        if (fetched_.find(index) == fetched_.end()) wanted.push_back(index);
+      }
+      pos += 3;
+    }
+    std::sort(wanted.begin(), wanted.end());
+
+    int produced = 0;
+    for (const uint32_t index : wanted) {
+      std::string ts, meta;
+      char path[64];
+      std::snprintf(path, sizeof(path), "/seg%u.ts", index);
+      if (!HttpGet(path, &ts, timeout_ms)) continue;
+      const uint64_t t_recv = ucv::NowNs();
+      std::snprintf(path, sizeof(path), "/seg%u.json", index);
+      if (!HttpGet(path, &meta, timeout_ms)) continue;
+
+      fetched_.insert(index);
+      segments_++;
+      segment_bytes_ += ts.size();
+      produced += ParseSidecar(meta, ts.size(), t_recv, out);
+    }
+    return produced;
+  }
+
+  uint64_t segments() const { return segments_; }
+  uint64_t segment_bytes() const { return segment_bytes_; }
+
+ private:
+  // The sidecar is a small fixed-shape array written by the sender, so it is
+  // scanned rather than parsed with a JSON library — one less dependency in a
+  // measurement binary, and a malformed entry is skipped instead of aborting a
+  // run that is otherwise fine.
+  int ParseSidecar(const std::string& json, size_t segment_bytes,
+                   uint64_t t_recv, std::vector<Reassembler::Complete>* out) {
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = json.find("{\"seq\":", pos)) != std::string::npos) {
+      unsigned long long seq = 0, cap = 0, enc = 0, snd = 0, bytes = 0;
+      char key[8] = {0};
+      const int matched = std::sscanf(
+          json.c_str() + pos,
+          "{\"seq\":%llu,\"cap\":%llu,\"enc\":%llu,\"snd\":%llu,"
+          "\"bytes\":%llu,\"key\":%5[a-z]",
+          &seq, &cap, &enc, &snd, &bytes, key);
+      pos += 7;
+      if (matched < 6) continue;
+      Reassembler::Complete f;
+      f.seq = static_cast<uint32_t>(seq);
+      f.t_capture_ns = cap;
+      f.t_encoded_ns = enc;
+      f.t_sent_ns = snd;
+      f.t_recv_ns = t_recv;
+      f.bytes = static_cast<uint32_t>(bytes);
+      f.keyframe = std::strncmp(key, "true", 4) == 0;
+      f.run_hash = 0;   // HLS has no per-frame run hash; the segment is the unit
+      // Wire cost is a segment-level fact. Charging it to the first frame keeps
+      // the run total exact instead of spreading an invented per-frame share.
+      f.wire_bytes = (count == 0) ? static_cast<uint32_t>(segment_bytes) : 0;
+      out->push_back(std::move(f));
+      count++;
+    }
+    return count;
+  }
+
+  bool HttpGet(const std::string& path, std::string* body, int timeout_ms) {
+    ucv::TcpClient tcp;
+    if (!tcp.Connect(phone_, port_, timeout_ms)) return false;
+    std::string request = "GET " + path +
+        " HTTP/1.1\r\nHost: phone\r\nConnection: close\r\n\r\n";
+    if (!tcp.SendAll(request.data(), request.size())) return false;
+
+    std::string raw;
+    char buf[16384];
+    for (;;) {
+      const int n = tcp.RecvTimeout(buf, sizeof(buf), timeout_ms);
+      if (n <= 0) break;
+      raw.append(buf, static_cast<size_t>(n));
+      if (raw.size() > 64u * 1024u * 1024u) return false;
+    }
+    if (raw.compare(0, 12, "HTTP/1.1 200") != 0) return false;
+    const size_t head = raw.find("\r\n\r\n");
+    if (head == std::string::npos) return false;
+    *body = raw.substr(head + 4);
+    return true;
+  }
+
+  std::string phone_;
+  int port_ = 0;
+  std::set<uint32_t> fetched_;
+  uint64_t segments_ = 0;
+  uint64_t segment_bytes_ = 0;
+};
+
 class SrtReceiver {
  public:
   ~SrtReceiver() { Close(); }
@@ -674,6 +805,7 @@ int main(int argc, char** argv) {
   ucv::UdpSocket video;
   ucv::UdpSender preview;
   MjpegReader mjpeg;
+  HlsReader hls;
   SrtReceiver srt;
   if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
       opt.protocol == "rtsp") {
@@ -706,12 +838,15 @@ int main(int argc, char** argv) {
                    opt.preview_port);
       opt.preview_port = 0;
     }
-  } else if (false) {
-    std::fprintf(stderr,
-                 "error: the mjpeg receiver is a separate reader (HTTP\n"
-                 "       multipart, not datagrams). Not yet implemented in\n"
-                 "       this binary — see docs/03-implementation-plan.md.\n");
-    return 2;
+  } else if (opt.protocol == "hls") {
+    // Nothing to bind: for HLS the receiver is the client and pulls segments
+    // from the phone's HTTP server. The preview is opened anyway so the
+    // dashboard behaves the same as for every other protocol.
+    if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
+      std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
+                   opt.preview_port);
+      opt.preview_port = 0;
+    }
   } else {
     std::fprintf(stderr, "error: protocol '%s' not implemented in this receiver\n",
                  opt.protocol.c_str());
@@ -728,7 +863,8 @@ int main(int argc, char** argv) {
     }
     const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
         (rtp_wire ? UCV_PROTO_RTSP :
-         (opt.protocol == "srt" ? UCV_PROTO_SRT : UCV_PROTO_RAWUDP));
+         (opt.protocol == "srt" ? UCV_PROTO_SRT :
+          (opt.protocol == "hls" ? UCV_PROTO_HLS : UCV_PROTO_RAWUDP)));
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
                                 protocol_id, opt.video_port)) {
@@ -764,6 +900,10 @@ int main(int argc, char** argv) {
       return 2;
     }
     std::printf("[recv] SRT connected (live/message, latency=20ms, encryption=off)\n");
+  } else if (opt.protocol == "hls") {
+    hls.Configure(opt.phone_ip, opt.video_port);
+    std::printf("[recv] polling HLS playlist http://%s:%d/live.m3u8\n",
+                opt.phone_ip.c_str(), opt.video_port);
   }
 
   // ------------------------------------------------------------------
@@ -820,6 +960,9 @@ int main(int argc, char** argv) {
 
   uint64_t frames_in_window = 0;
   auto     last_report = t_start;
+  // HLS arrives a segment at a time; frames wait here to be scored
+  // individually so their statistics match every other protocol.
+  std::vector<Reassembler::Complete> hls_pending;
 
   while (!g_quit && std::chrono::steady_clock::now() < t_end) {
     if (opt.protocol == "mjpeg") {
@@ -871,6 +1014,53 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(frames_in_window),
                     transport_ms.Percentile(0.50), jitter.jitter_ms(),
                     tcp_loss);
+        last_report = now;
+      }
+      continue;
+    }
+
+    if (opt.protocol == "hls") {
+      // A poll yields a whole segment's worth of frames at once. They are
+      // drained one at a time so every frame is scored exactly like any other
+      // protocol's — the batching shows up in the latency numbers, which is the
+      // finding, rather than in a different accounting path.
+      if (hls_pending.empty()) {
+        const int produced = hls.Poll(&hls_pending, 1000);
+        if (produced <= 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
+        }
+      }
+      Reassembler::Complete f = std::move(hls_pending.front());
+      hls_pending.erase(hls_pending.begin());
+
+      bytes_wire += f.wire_bytes;
+      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!seq.Observe(f.seq)) continue;
+
+      const double transport = (static_cast<int64_t>(f.t_recv_ns) +
+                                sync_before.offset_ns -
+                                static_cast<int64_t>(f.t_sent_ns)) / 1e6;
+      const double glass = (static_cast<int64_t>(f.t_recv_ns) +
+                            sync_before.offset_ns -
+                            static_cast<int64_t>(f.t_capture_ns)) / 1e6;
+      transport_ms.Add(transport);
+      glass_ms.Add(glass);
+      encode_ms.Add((static_cast<int64_t>(f.t_encoded_ns) -
+                     static_cast<int64_t>(f.t_capture_ns)) / 1e6);
+      jitter.Update(static_cast<int64_t>(f.t_sent_ns),
+                    static_cast<int64_t>(f.t_recv_ns));
+      bytes_payload += f.bytes;
+      frames_in_window++;
+      log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
+                     f.t_recv_ns, f.bytes, f.keyframe, 0, 0);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_report >= std::chrono::seconds(5)) {
+        std::printf("[recv] %6llu HLS frames  %llu segments  "
+                    "transport p50=%.1f ms  jitter=%.2f ms\n",
+                    static_cast<unsigned long long>(frames_in_window),
+                    static_cast<unsigned long long>(hls.segments()),
+                    transport_ms.Percentile(0.50), jitter.jitter_ms());
         last_report = now;
       }
       continue;
