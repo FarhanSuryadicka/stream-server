@@ -19,8 +19,10 @@
 #include "ucv_net.h"
 #include "ucv_log.h"
 #include <srt.h>
+#include <rtc/rtc.hpp>
 
 #include <algorithm>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -63,7 +65,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
       "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg |\n"
-      "                        hls | rtmp        (default: raw_udp)\n"
+      "                        hls | rtmp | webrtc   (default: raw_udp)\n"
       "                        rtsp receives the same RTP packets as rtp_udp;\n"
       "                        only the sender differs, so the run records\n"
       "                        which one was used. hls polls the phone's\n"
@@ -139,6 +141,10 @@ bool ParseArgs(int argc, char** argv, Options* o) {
   // the port WE listen on.
   if (o->protocol == "rtmp" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_RTMPS;
+  // For WebRTC the port is the SIGNALLING port we listen on; media then
+  // flows over ICE-negotiated ports chosen at runtime.
+  if (o->protocol == "webrtc" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_SIGNAL;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -658,6 +664,244 @@ class HlsReader {
   uint64_t segment_bytes_ = 0;
 };
 
+// WebRTC reader: signalling server + answering peer, using the same vendored
+// libdatachannel the phone links.
+//
+// The phone is the offerer. This side runs a minimal length-prefixed SDP
+// exchange over TCP (our own, not a WebSocket — see ucv_transport_webrtc.cpp for
+// why signalling is kept visible rather than hidden in a dependency), then
+// answers and receives.
+//
+// ## Pairing media with instrumentation
+//
+// WebRTC gives no place to put the UCV header in the RTP stream that
+// libdatachannel exposes, so the phone sends it over the data channel. The two
+// arrive independently: media over unreliable SRTP, metadata over reliable
+// ordered SCTP. They are therefore matched by RTP TIMESTAMP, which the sender
+// derives from t_capture_ns — not by arrival order, which would desynchronise
+// permanently the first time a media frame was lost.
+//
+// A frame is only reported once both halves are present. Media without metadata
+// cannot be timed; metadata without media is a lost frame and shows up as a
+// sequence gap, which is the correct finding.
+class WebrtcReader {
+ public:
+  bool Listen(int port) {
+    if (!server_.Listen(port)) return false;
+    port_ = port;
+    return true;
+  }
+
+  // Performs the SDP exchange and brings the peer connection up.
+  bool Accept(int timeout_ms) {
+    if (!server_.AcceptTimeout(timeout_ms)) return false;
+
+    std::string line;
+    if (!RecvLine(&line)) return false;
+    size_t len = 0;
+    if (std::sscanf(line.c_str(), "OFFER %zu", &len) != 1 ||
+        len == 0 || len > 256 * 1024) {
+      std::fprintf(stderr, "webrtc: bad signalling header: %s\n", line.c_str());
+      return false;
+    }
+    std::string offer;
+    if (!RecvExact(&offer, len)) return false;
+
+    rtc::Configuration config;
+    // No STUN/TURN, matching the sender: the rig is one LAN, and a public STUN
+    // server would put an internet round trip inside setup.
+    try {
+      pc_ = std::make_shared<rtc::PeerConnection>(config);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "webrtc: PeerConnection failed: %s\n", e.what());
+      return false;
+    }
+
+    pc_->onTrack([this](std::shared_ptr<rtc::Track> track) {
+      track_ = track;
+      auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
+      track->setMediaHandler(depacketizer);
+      track->onFrame([this](rtc::binary data, rtc::FrameInfo info) {
+        const uint64_t t_recv = ucv::NowNs();
+        std::lock_guard<std::mutex> g(lock_);
+        media_bytes_ += data.size();
+        auto it = pending_meta_.find(info.timestamp);
+        if (it != pending_meta_.end()) {
+          Emit(it->second, data.size(), t_recv);
+          pending_meta_.erase(it);
+        } else {
+          pending_media_[info.timestamp] = {data.size(), t_recv};
+          TrimPending();
+        }
+      });
+    });
+
+    pc_->onDataChannel([this](std::shared_ptr<rtc::DataChannel> dc) {
+      meta_channel_ = dc;
+      dc->onMessage([this](rtc::message_variant msg) {
+        if (!std::holds_alternative<rtc::binary>(msg)) return;
+        const auto& bin = std::get<rtc::binary>(msg);
+        if (bin.size() < sizeof(ucv_frame_header_t)) return;
+        ucv_frame_header_t h;
+        std::memcpy(&h, bin.data(), sizeof(h));
+        if (!ucv_frame_header_valid(&h)) {
+          std::lock_guard<std::mutex> g(lock_);
+          bad_meta_++;
+          return;
+        }
+        // The same derivation the sender used for the RTP timestamp.
+        const uint32_t key =
+            static_cast<uint32_t>((h.t_capture_ns / 100000ull) * 9ull);
+        std::lock_guard<std::mutex> g(lock_);
+        auto it = pending_media_.find(key);
+        if (it != pending_media_.end()) {
+          Emit(h, it->second.bytes, it->second.t_recv);
+          pending_media_.erase(it);
+        } else {
+          pending_meta_[key] = h;
+          TrimPending();
+        }
+      });
+    });
+
+    try {
+      pc_->setRemoteDescription(rtc::Description(offer, "offer"));
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "webrtc: bad offer: %s\n", e.what());
+      return false;
+    }
+
+    // Gather fully before answering: one signalling round trip, no trickle ICE.
+    {
+      std::mutex m;
+      std::condition_variable cv;
+      bool done = false;
+      pc_->onGatheringStateChange([&](rtc::PeerConnection::GatheringState s) {
+        if (s == rtc::PeerConnection::GatheringState::Complete) {
+          std::lock_guard<std::mutex> g(m);
+          done = true;
+          cv.notify_all();
+        }
+      });
+      std::unique_lock<std::mutex> g(m);
+      cv.wait_for(g, std::chrono::seconds(5), [&] { return done; });
+    }
+
+    std::string answer;
+    if (auto local = pc_->localDescription())
+      answer = std::string(local.value());
+    if (answer.empty()) {
+      std::fprintf(stderr, "webrtc: no local description to answer with\n");
+      return false;
+    }
+    char head[64];
+    const int hn = std::snprintf(head, sizeof(head), "ANSWER %zu\n",
+                                 answer.size());
+    if (!server_.SendAll(head, static_cast<size_t>(hn)) ||
+        !server_.SendAll(answer.data(), answer.size()))
+      return false;
+    return true;
+  }
+
+  // 1 = frame produced, 0 = nothing yet.
+  int ReadFrame(Reassembler::Complete* out, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> g(lock_);
+        if (!ready_.empty()) {
+          *out = std::move(ready_.front());
+          ready_.erase(ready_.begin());
+          return 1;
+        }
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return 0;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+
+  uint64_t media_bytes() const {
+    std::lock_guard<std::mutex> g(lock_);
+    return media_bytes_;
+  }
+  uint64_t unmatched() const {
+    std::lock_guard<std::mutex> g(lock_);
+    return pending_media_.size() + pending_meta_.size();
+  }
+  uint64_t bad_meta() const {
+    std::lock_guard<std::mutex> g(lock_);
+    return bad_meta_;
+  }
+
+ private:
+  struct PendingMedia {
+    size_t   bytes;
+    uint64_t t_recv;
+  };
+
+  // Called with lock_ held.
+  void Emit(const ucv_frame_header_t& h, size_t bytes, uint64_t t_recv) {
+    Reassembler::Complete f;
+    f.seq = h.frame_seq;
+    f.t_capture_ns = h.t_capture_ns;
+    f.t_encoded_ns = h.t_encoded_ns;
+    f.t_sent_ns = h.t_sent_ns;
+    f.t_recv_ns = t_recv;
+    // The depacketized payload size, not the sender's claim: this is what
+    // actually arrived and survived SRTP.
+    f.bytes = static_cast<uint32_t>(bytes);
+    f.keyframe = (h.flags & UCV_FLAG_KEYFRAME) != 0;
+    f.run_hash = h.run_id_hash;
+    f.wire_bytes = 0;  // SRTP/RTP overhead is not visible above this API
+    ready_.push_back(std::move(f));
+  }
+
+  // Called with lock_ held. A half that never finds its partner would otherwise
+  // accumulate for the whole run; 256 is far more than any plausible reordering
+  // and keeps a lost media frame from pinning its metadata forever.
+  void TrimPending() {
+    while (pending_media_.size() > 256) pending_media_.erase(pending_media_.begin());
+    while (pending_meta_.size() > 256) pending_meta_.erase(pending_meta_.begin());
+  }
+
+  bool RecvLine(std::string* out) {
+    out->clear();
+    for (;;) {
+      char c;
+      const int n = server_.RecvTimeout(&c, 1, 5000);
+      if (n <= 0) return false;
+      if (c == '\n') return true;
+      out->push_back(c);
+      if (out->size() > 64) return false;
+    }
+  }
+
+  bool RecvExact(std::string* out, size_t len) {
+    out->assign(len, '\0');
+    size_t off = 0;
+    while (off < len) {
+      const int n = server_.RecvTimeout(&(*out)[off], len - off, 5000);
+      if (n <= 0) return false;
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  ucv::TcpServer server_;
+  int port_ = 0;
+  std::shared_ptr<rtc::PeerConnection> pc_;
+  std::shared_ptr<rtc::Track>          track_;
+  std::shared_ptr<rtc::DataChannel>    meta_channel_;
+
+  mutable std::mutex lock_;
+  std::map<uint32_t, ucv_frame_header_t> pending_meta_;
+  std::map<uint32_t, PendingMedia>       pending_media_;
+  std::vector<Reassembler::Complete>     ready_;
+  uint64_t media_bytes_ = 0;
+  uint64_t bad_meta_ = 0;
+};
+
 // RTMP reader: the receiver acts as the media server the phone publishes to,
 // which is the role MediaMTX or nginx-rtmp would normally fill. Implementing it
 // here keeps the measurement path down to two boxes and, more importantly,
@@ -1032,6 +1276,7 @@ int main(int argc, char** argv) {
   MjpegReader mjpeg;
   HlsReader hls;
   RtmpReader rtmp;
+  WebrtcReader webrtc;
   SrtReceiver srt;
   if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
       opt.protocol == "rtsp") {
@@ -1057,6 +1302,17 @@ int main(int argc, char** argv) {
     if (!srt.Listen(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot listen for SRT on :%d: %s\n",
                    opt.video_port, srt_getlasterror_str());
+      return 1;
+    }
+    if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
+      std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
+                   opt.preview_port);
+      opt.preview_port = 0;
+    }
+  } else if (opt.protocol == "webrtc") {
+    if (!webrtc.Listen(opt.video_port)) {
+      std::fprintf(stderr, "fatal: cannot listen for WebRTC signalling on :%d\n",
+                   opt.video_port);
       return 1;
     }
     if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
@@ -1102,7 +1358,9 @@ int main(int argc, char** argv) {
         (rtp_wire ? UCV_PROTO_RTSP :
          (opt.protocol == "srt" ? UCV_PROTO_SRT :
           (opt.protocol == "hls" ? UCV_PROTO_HLS :
-           (opt.protocol == "rtmp" ? UCV_PROTO_RTMPS : UCV_PROTO_RAWUDP))));
+           (opt.protocol == "rtmp" ? UCV_PROTO_RTMPS :
+            (opt.protocol == "webrtc" ? UCV_PROTO_WEBRTC
+                                      : UCV_PROTO_RAWUDP)))));
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
                                 protocol_id, opt.video_port)) {
@@ -1138,6 +1396,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     std::printf("[recv] SRT connected (live/message, latency=20ms, encryption=off)\n");
+  } else if (opt.protocol == "webrtc") {
+    if (!webrtc.Accept(20000)) {
+      std::fprintf(stderr, "fatal: WebRTC signalling/handshake failed on :%d\n",
+                   opt.video_port);
+      if (opt.remote_phone) control.StopRemoteRun();
+      return 2;
+    }
+    std::printf("[recv] WebRTC connected (DTLS-SRTP, data channel for metadata)\n");
   } else if (opt.protocol == "rtmp") {
     if (!rtmp.Accept(10000)) {
       std::fprintf(stderr, "fatal: phone did not publish RTMP to :%d\n",
@@ -1260,6 +1526,43 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(frames_in_window),
                     transport_ms.Percentile(0.50), jitter.jitter_ms(),
                     tcp_loss);
+        last_report = now;
+      }
+      continue;
+    }
+
+    if (opt.protocol == "webrtc") {
+      Reassembler::Complete f;
+      const int result = webrtc.ReadFrame(&f, 200);
+      if (result == 0) continue;
+      if (result < 0) break;
+      if (f.run_hash != expected_run_hash) { wrong_run++; continue; }
+      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!seq.Observe(f.seq)) continue;
+
+      const double transport = (static_cast<int64_t>(f.t_recv_ns) +
+                                sync_before.offset_ns -
+                                static_cast<int64_t>(f.t_sent_ns)) / 1e6;
+      const double glass = (static_cast<int64_t>(f.t_recv_ns) +
+                            sync_before.offset_ns -
+                            static_cast<int64_t>(f.t_capture_ns)) / 1e6;
+      transport_ms.Add(transport);
+      glass_ms.Add(glass);
+      encode_ms.Add((static_cast<int64_t>(f.t_encoded_ns) -
+                     static_cast<int64_t>(f.t_capture_ns)) / 1e6);
+      jitter.Update(static_cast<int64_t>(f.t_sent_ns),
+                    static_cast<int64_t>(f.t_recv_ns));
+      bytes_payload += f.bytes;
+      frames_in_window++;
+      log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
+                     f.t_recv_ns, f.bytes, f.keyframe, 0, 0);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_report >= std::chrono::seconds(5)) {
+        std::printf("[recv] %6llu WebRTC frames  transport p50=%.1f ms  "
+                    "jitter=%.2f ms  unpaired=%llu\n",
+                    static_cast<unsigned long long>(frames_in_window),
+                    transport_ms.Percentile(0.50), jitter.jitter_ms(),
+                    static_cast<unsigned long long>(webrtc.unmatched()));
         last_report = now;
       }
       continue;
@@ -1566,14 +1869,30 @@ int main(int argc, char** argv) {
 
   if (dur_s > 0.0) {
     const double goodput = 8.0 * static_cast<double>(bytes_payload) / dur_s / 1e6;
+    // Signed difference: bytes_wire and bytes_payload are uint64_t, and any
+    // protocol whose wire figure comes out below its payload total (WebRTC,
+    // where RTP/SRTP framing is below the API, or a partial warmup window)
+    // wrapped this to ~1.8e19 and printed an overhead of 1e15 %.
     const double overhead = bytes_payload > 0
-        ? 100.0 * static_cast<double>(bytes_wire - bytes_payload) /
+        ? 100.0 * static_cast<double>(static_cast<int64_t>(bytes_wire) -
+                                      static_cast<int64_t>(bytes_payload)) /
               static_cast<double>(bytes_payload)
         : 0.0;
-    std::printf("\nEfficiency\n"
-                "  goodput            %.2f Mbps\n"
-                "  app-layer overhead %.2f %%   (packet capture needed for true wire overhead)\n",
-                goodput, overhead);
+    // A protocol whose framing sits below the receive API (WebRTC: RTP headers,
+    // SRTP tags, SCTP) reports no wire total at all. Printing a computed number
+    // from a zero would claim -100 % overhead, which is worse than saying so.
+    if (bytes_wire == 0) {
+      std::printf("\nEfficiency\n"
+                  "  goodput            %.2f Mbps\n"
+                  "  app-layer overhead n/a      (not observable above this\n"
+                  "                              protocol's API — needs a packet capture)\n",
+                  goodput);
+    } else {
+      std::printf("\nEfficiency\n"
+                  "  goodput            %.2f Mbps\n"
+                  "  app-layer overhead %.2f %%   (packet capture needed for true wire overhead)\n",
+                  goodput, overhead);
+    }
   }
 
   if (opt.control_load) {
@@ -1616,6 +1935,12 @@ int main(int argc, char** argv) {
               "    counts application bytes only and cannot see retransmits.\n");
 
   if (opt.protocol == "rtmp") bytes_wire = rtmp.wire_bytes();
+  // NOT set for WebRTC on purpose. RTP headers, SRTP authentication tags and
+  // SCTP framing all live below libdatachannel's frame API, so no wire figure is
+  // observable here. media_bytes() counts depacketized payload — reporting it as
+  // "wire" would understate overhead and, being smaller than the post-warmup
+  // payload total, is what produced the 1e15 % nonsense. Overhead for WebRTC
+  // needs a packet capture; the printed caveat already says so.
   const bool udp_protocol = opt.protocol == "raw_udp" || rtp_wire;
   const uint64_t summary_packets_received = opt.protocol == "srt"
       ? srt_received : (udp_protocol ? packets.received() : tcp_segments);

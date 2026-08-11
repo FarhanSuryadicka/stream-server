@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(ucv_receiver CXX)
+# C as well as CXX: the vendored WebRTC dependencies (Mbed TLS, libSRTP,
+# libjuice, usrsctp) are C, and without a configured C compiler CMake fails with
+# "required internal CMake variable not set".
+project(ucv_receiver C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +16,23 @@ set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
 set(ENABLE_STDCXX_SYNC ON CACHE BOOL "" FORCE)
 set(SRT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../app/src/main/cpp/srt)
 add_subdirectory(${SRT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/srt EXCLUDE_FROM_ALL)
+
+# WebRTC: the SAME vendored libdatachannel and Mbed TLS the Android app links,
+# built from one tree for both sides. Two copies could drift to different DTLS
+# or SRTP versions, and a handshake mismatch would look like a network fault on
+# the rig rather than a version skew.
+set(UCV_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../app/src/main/cpp)
+list(APPEND CMAKE_MODULE_PATH ${UCV_CPP_DIR}/cmake)
+include(${UCV_CPP_DIR}/cmake/mbedtls-vendored.cmake)
+set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(LIBSRTP_TEST_APPS OFF CACHE BOOL "" FORCE)
+set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${UCV_CPP_DIR}/libdatachannel ${CMAKE_BINARY_DIR}/ldc EXCLUDE_FROM_ALL)
 
 if(NOT CMAKE_BUILD_TYPE)
   # Measurement code compiled -O0 would add its own latency to the numbers it
@@ -29,8 +49,9 @@ target_include_directories(ucv-receiver PRIVATE
     ${SRT_SOURCE_DIR}/srtcore
     ${SRT_SOURCE_DIR}/common
     ${CMAKE_BINARY_DIR}/srt
+    ${UCV_CPP_DIR}/libdatachannel/include
 )
-target_link_libraries(ucv-receiver PRIVATE srt_static)
+target_link_libraries(ucv-receiver PRIVATE srt_static datachannel-static)
 
 # Verifies the measurement primitives: wire layout, CRC rejection, clock-offset
 # recovery, percentiles, loss/reorder accounting, and jitter's independence
@@ -43,13 +64,22 @@ add_executable(ucv-selftest src/selftest.cpp)
 # path, never a protocol.
 add_executable(ucv-mocksender src/mocksender.cpp)
 
+# Phone stand-in for the WebRTC path, so that measurement path can be validated
+# on one machine too. Same caveat as ucv-mocksender: its numbers describe
+# loopback, never WebRTC.
+add_executable(ucv-webrtc-mocksender src/webrtc_mocksender.cpp)
+target_include_directories(ucv-webrtc-mocksender PRIVATE
+    ${UCV_CPP_DIR}/libdatachannel/include)
+target_link_libraries(ucv-webrtc-mocksender PRIVATE datachannel-static)
+
 # Mirrors the JPEG -> NV12 conversion in the Android encoder path. A chroma
 # ordering or stride bug there does not crash — it produces a stream that
 # encodes and transmits perfectly and looks wrong, which gets blamed on the
 # protocol under test. Cheaper to catch here than on the rig.
 add_executable(ucv-nv12test src/nv12test.cpp)
 
-set(UCV_TARGETS ucv-receiver ucv-selftest ucv-mocksender ucv-nv12test)
+set(UCV_TARGETS ucv-receiver ucv-selftest ucv-mocksender ucv-nv12test
+    ucv-webrtc-mocksender)
 
 foreach(t IN LISTS UCV_TARGETS)
   target_include_directories(${t} PRIVATE include)

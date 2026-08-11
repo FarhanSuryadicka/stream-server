@@ -9,7 +9,14 @@
 # Split into the three canonical libraries (crypto / x509 / tls) because
 # libdatachannel and libSRTP link them by those names.
 
-set(UCV_MBEDTLS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mbedtls)
+# Both builds share this file: the Android app links it from app/src/main/cpp,
+# and the PC receiver links the same vendored tree from experiment/receiver so
+# the two sides cannot end up on different crypto versions. The caller may set
+# UCV_CPP_DIR; it defaults to the including directory for the Android build.
+if(NOT DEFINED UCV_CPP_DIR)
+    set(UCV_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+set(UCV_MBEDTLS_DIR ${UCV_CPP_DIR}/mbedtls)
 set(UCV_MBEDTLS_INCLUDE_DIR ${UCV_MBEDTLS_DIR}/include CACHE INTERNAL "")
 
 file(GLOB UCV_MBEDCRYPTO_SOURCES

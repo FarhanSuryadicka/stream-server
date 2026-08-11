@@ -74,9 +74,9 @@ Android bersifat dinamis, jadi lihat kembali menu **Proses debug nirkabel**.
 | RTP/UDP H.264 | selesai | selesai | Data plane selesai |
 | RTSP H.264 | selesai, smoke test lulus | selesai (memakai jalur RTP) | Belum diuji pada HP/kamera |
 | SRT H.264 | selesai dan build lulus | selesai dan build lulus | Belum diuji pada HP/kamera |
-| HLS | selesai, smoke test lulus | **reader PC belum ada** | Sender saja |
-| RTMP | selesai, smoke test lulus | **reader PC belum ada** | Sender saja; **plaintext, bukan RTMPS** |
-| WebRTC | stub (NULL) | belum | Terblokir: butuh vendoring DTLS/SRTP |
+| HLS | selesai | selesai | E2E terukur: 150 frame, p50 ~744 ms |
+| RTMP | selesai | selesai | E2E terukur: 151 frame, p50 ~0.36 ms; **plaintext, bukan RTMPS** |
+| WebRTC | selesai | selesai | E2E terukur: 149 frame, p50 ~0.65 ms |
 
 RTSP signalling sekarang sudah ada (`OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`/
 `TEARDOWN` + SDP) di `ucv_transport_rtsp.c`, HP sebagai server pada TCP 8554.
@@ -88,11 +88,28 @@ mana yang benar-benar dipakai.
 jadi menamainya RTMPS akan mengklaim properti keamanan yang tidak ada.
 `transport->name` sengaja `"rtmp"`.
 
-**WebRTC masih NULL dan itu disengaja.** WebRTC mewajibkan DTLS-SRTP; tidak ada
-DTLS/SRTP/ICE/SCTP yang divendor (haicrypt milik SRT hanya shim di atas
-mbedTLS/OpenSSL, dan `ENABLE_ENCRYPTION` off). Mengirim RTP plaintext lalu
-melabelinya "webrtc" persis jenis mislabel yang harus dicegah. Perlu keputusan
-vendoring `libdatachannel` + crypto backend lebih dulu.
+**WebRTC sudah jalan.** libdatachannel + Mbed TLS 3.6.2 divendor di
+`app/src/main/cpp/libdatachannel` dan `app/src/main/cpp/mbedtls` (~26 MB source,
+docs/tests/examples sudah di-strip, tidak ada nested `.git`). Terbangun untuk
+Android arm64 **dan** MinGW dari satu tree, jadi kedua sisi tidak mungkin beda
+versi DTLS/SRTP.
+
+- Crypto backend: Mbed TLS (`USE_MBEDTLS`), bukan OpenSSL — footprint NDK
+  terkecil. `MBEDTLS_SSL_DTLS_SRTP` wajib di-define, kalau tidak link gagal.
+- Glue CMake ada di `app/src/main/cpp/cmake/` (`FindMbedTLS.cmake` +
+  `mbedtls-vendored.cmake`) supaya tree vendored tetap identik upstream.
+- Media: track H.264 eksternal, **tanpa re-encode** (config encoder beku
+  harness §2 tidak boleh dilanggar).
+- Instrumentasi lewat **data channel**, karena libdatachannel tidak menyediakan
+  RTP header extension generik. Media dan metadata dipasangkan berdasarkan
+  **RTP timestamp**, bukan urutan kedatangan — urutan akan desinkron permanen
+  begitu ada satu media frame hilang.
+- Signalling: pertukaran SDP length-prefixed di TCP `8203`, milik proyek ini
+  sendiri (bukan WebSocket libdatachannel), supaya biaya operasionalnya tercatat.
+- Tanpa STUN/TURN: rig hanya satu LAN. **Angka WebRTC ini LAN best case, bukan
+  hasil NAT traversal** — catat itu di laporan.
+- `ucv-webrtc-mocksender` adalah stand-in HP untuk jalur WebRTC, sama peran
+  dengan `ucv-mocksender`. Angkanya loopback, bukan WebRTC.
 
 ## 5. Pipeline Android
 

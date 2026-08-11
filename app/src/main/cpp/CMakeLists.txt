@@ -222,6 +222,7 @@ add_library(uvcserver SHARED
     ucv_transport_rtsp.c
     ucv_transport_hls.c
     ucv_transport_rtmp.c
+    ucv_transport_webrtc.cpp
     ucv_transport_srt.c
     ucv_control.c
     ucv_encoder.c
@@ -234,6 +235,7 @@ target_include_directories(uvcserver
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../experiment/receiver/include
         ${CMAKE_CURRENT_SOURCE_DIR}/srt/srtcore
+        ${CMAKE_CURRENT_SOURCE_DIR}/libdatachannel/include
         ${CMAKE_CURRENT_SOURCE_DIR}/srt/common
         ${CMAKE_CURRENT_BINARY_DIR}/srt
 )
@@ -245,6 +247,9 @@ target_link_libraries(uvcserver
         m
         jpeg-static
         srt_static
+        # WebRTC: DTLS-SRTP + ICE + SCTP. datachannel-static pulls in
+        # srtp2/juice/usrsctp and the Mbed TLS trio transitively.
+        datachannel-static
         # MediaCodec via the NDK, so capture -> decode -> encode -> transport
         # all run in native code on one clock (see ucv_encoder.h).
         mediandk
