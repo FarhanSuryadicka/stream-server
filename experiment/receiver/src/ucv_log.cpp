@@ -1,5 +1,9 @@
 #include "ucv_log.h"
 
+#ifdef _WIN32
+#include <share.h>  // _SH_DENYWR for the shared-read open below
+#endif
+
 namespace ucv {
 
 namespace {
@@ -26,7 +30,18 @@ std::string JsonEscape(const std::string& value) {
 
 NdjsonWriter::NdjsonWriter(const std::string& path) {
 #ifdef _WIN32
-  fopen_s(&f_, path.c_str(), "wb");
+  // Share the log for reading while the run is in progress.
+  //
+  // fopen/fopen_s open with exclusive access on Windows, which locks the whole
+  // file for the lifetime of the run. The dashboard polls this file to draw the
+  // live charts, and against an exclusive writer every read failed with EACCES
+  // until the receiver exited — so the graphs stayed empty until the operator
+  // pressed Stop. Sharing is the writer's decision: a reader cannot opt in on
+  // its own, so it has to be granted here.
+  //
+  // _SH_DENYWR still denies other WRITERS, so a second receiver cannot
+  // interleave lines into the same log and corrupt a measurement.
+  f_ = _fsopen(path.c_str(), "wb", _SH_DENYWR);
 #else
   f_ = std::fopen(path.c_str(), "wb");
 #endif

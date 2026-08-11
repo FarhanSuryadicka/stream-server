@@ -9,6 +9,7 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>  // after winsock2.h: windows.h would pull in winsock 1
   #ifdef _MSC_VER
     #pragma comment(lib, "ws2_32.lib")
   #endif
@@ -68,10 +69,38 @@ uint64_t NowNs() {
           .count());
 }
 
+#ifdef _WIN32
+namespace {
+// Console control events are NOT delivered as SIGINT by the CRT: CTRL_BREAK
+// arrives as SIGBREAK and CTRL_CLOSE as no signal at all. The dashboard stops a
+// run early by sending CTRL_BREAK, and a missed stop means the receiver is hard
+// killed before WriteSummary() — leaving a log with no summary line, which can
+// never be counted as a valid run. Handling the console events directly covers
+// every way the run can be asked to stop.
+BOOL WINAPI ConsoleCtrlHandler(DWORD type) {
+  switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      if (g_on_quit) g_on_quit();
+      return TRUE;  // handled: do not run the default terminator
+    default:
+      return FALSE;
+  }
+}
+}  // namespace
+#endif
+
 void InstallSignalHandler(void (*on_quit)()) {
   g_on_quit = on_quit;
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
+#ifdef _WIN32
+  std::signal(SIGBREAK, HandleSignal);
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
 }
 
 std::string MakeRunId(const std::string& protocol) {

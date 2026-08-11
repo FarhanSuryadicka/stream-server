@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -36,6 +37,11 @@ DEFAULT_RESULTS = EXPERIMENT_DIR / "results"
 RECEIVER_EXE = EXPERIMENT_DIR / "receiver" / "build" / "ucv-receiver.exe"
 LABELS_FILE = ".dashboard-labels.json"
 SAFE_TEXT = re.compile(r"^[A-Za-z0-9_.@-]{1,96}$")
+# Operator-authored comparison label. Deliberately looser than SAFE_TEXT —
+# spaces and a few separators make a group name readable ("720p wifi 5GHz") —
+# but no angle brackets, quotes or control characters, since these strings are
+# rendered in the dashboard and written to the labels JSON.
+GROUP_TEXT = re.compile(r"^[A-Za-z0-9 _.@:+/()x-]{1,64}$")
 MODE_TEXT = re.compile(r"^\d{2,5}x\d{2,5}@\d{1,3}$")
 PREVIEW_MAGIC = 0x31565055
 PREVIEW_HEADER = struct.Struct("<IIIHH")
@@ -345,15 +351,27 @@ class DashboardState:
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def save_label(self, relative_path: str, mode: str, condition: str) -> None:
+    def save_label(self, relative_path: str, mode: str | None, condition: str | None,
+                   group: str = "") -> None:
         target = (self.results_dir / relative_path).resolve()
         if self.results_dir not in target.parents or not target.is_file():
             raise ValueError("run file is outside the results directory")
         labels = self.load_labels()
-        labels[relative_path.replace("\\", "/")] = {
-            "mode": mode or "unknown",
-            "condition": condition or "unspecified",
-        }
+        key = relative_path.replace("\\", "/")
+        existing = labels.get(key, {})
+        entry: dict = {}
+        # mode/condition are no longer operator-editable — the receiver records
+        # them in the NDJSON itself. None means "leave whatever a previous label
+        # set", so overrides applied to older logs are not silently discarded.
+        for field, value in (("mode", mode), ("condition", condition)):
+            chosen = value if value is not None else existing.get(field)
+            if chosen:
+                entry[field] = chosen
+        # Only stored when set, so clearing the field returns the run to being
+        # grouped by its real capture mode.
+        if group:
+            entry["group"] = group
+        labels[key] = entry
         temp = self.labels_path.with_suffix(".tmp")
         temp.write_text(json.dumps(labels, indent=2), encoding="utf-8")
         temp.replace(self.labels_path)
@@ -409,11 +427,30 @@ class DashboardState:
                 "run_id": run_id, "phone": phone, "mode": mode,
                 "condition": condition,
             }
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            flags = 0
+            startupinfo = None
+            if os.name == "nt":
+                # NEW_PROCESS_GROUP makes the receiver addressable by
+                # CTRL_BREAK_EVENT, which its console handler turns into a clean
+                # shutdown that writes the summary line. Without the group the
+                # event would hit this dashboard too.
+                #
+                # CREATE_NO_WINDOW must NOT be combined with it: a process with
+                # no console receives no console control events at all, so the
+                # stop request was silently dropped and the receiver had to be
+                # hard killed — producing a log with no summary, permanently
+                # stuck at "RUNNING" and never countable as valid. Verified both
+                # ways. The window is hidden through STARTUPINFO instead, which
+                # keeps a console attached for the signal to arrive on.
+                flags = subprocess.CREATE_NEW_PROCESS_GROUP
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
             self.process = subprocess.Popen(
                 command, cwd=REPO_DIR, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                 errors="replace", bufsize=1, creationflags=flags,
+                startupinfo=startupinfo,
             )
             threading.Thread(target=self._pump_output, daemon=True).start()
             return dict(self.session)
@@ -440,7 +477,29 @@ class DashboardState:
         if process and process.poll() is None:
             if phone:
                 stop_phone_pipeline(phone)
-            process.terminate()
+            # Ask for a graceful stop first. terminate() is TerminateProcess on
+            # Windows, which delivers no signal at all — the receiver then dies
+            # before writing its summary line, and a run with no summary is
+            # permanently stuck at clock_status "RUNNING" and can never be
+            # counted as valid. The receiver's handler turns CTRL_BREAK into
+            # g_quit and exits through the normal summary path.
+            graceful = False
+            if os.name == "nt":
+                try:
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                    graceful = True
+                except (OSError, ValueError, AttributeError):
+                    graceful = False
+            else:
+                process.terminate()  # SIGTERM is already handled there
+                graceful = True
+            if graceful:
+                try:
+                    process.wait(timeout=10)
+                    return
+                except subprocess.TimeoutExpired:
+                    pass  # fall through to the hard kill below
+            process.kill()
 
     def session_snapshot(self) -> dict:
         with self.lock:
@@ -457,7 +516,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
     frames: list[dict] = []
     parse_errors = 0
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
                     record = json.loads(line)
@@ -517,6 +576,11 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         if include_series:
             series.append({
                 "i": index + 1, "seq": frame.get("seq", 0),
+                # Seconds since the run's first received frame. Derived from
+                # rcv_ns (PC clock) so it needs no clock-offset correction, and
+                # measured against the first frame rather than the log's own
+                # start so warmup discards do not shift the axis.
+                "t": round((rcv - int(frames[0]["rcv_ns"])) / 1e9, 3),
                 "latency": round(trans_ms, 4),
                 "jitter": round(jitter_ns / 1e6, 4),
                 "loss": round(running_loss, 5),
@@ -539,6 +603,8 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         "protocol": meta.get("protocol", "unknown"),
         "mode": mode,
         "condition": condition,
+        # Operator-chosen comparison bucket. Empty means "group by capture mode".
+        "group": str(label.get("group", "")),
         "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
         "valid": clock_status == "OK" and bool(frames),
         "clock_status": clock_status,
@@ -684,13 +750,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if self.path == "/api/label":
-                mode = str(request.get("mode", "unknown")).strip().lower()
-                condition = str(request.get("condition", "unspecified")).strip().lower()
-                if mode != "unknown" and not MODE_TEXT.fullmatch(mode):
+                # Absent (not merely empty) means "keep what is already stored".
+                mode = request.get("mode")
+                mode = str(mode).strip().lower() if mode is not None else None
+                condition = request.get("condition")
+                condition = str(condition).strip().lower() if condition is not None else None
+                group = " ".join(str(request.get("group", "")).split())
+                if mode not in (None, "unknown") and not MODE_TEXT.fullmatch(mode):
                     raise ValueError("mode must look like 320x240@20")
-                if not SAFE_TEXT.fullmatch(condition):
+                if condition is not None and not SAFE_TEXT.fullmatch(condition):
                     raise ValueError("invalid condition")
-                self.state.save_label(str(request.get("file", "")), mode, condition)
+                if group and not GROUP_TEXT.fullmatch(group):
+                    raise ValueError("group may use letters, numbers, spaces and _.@:+/()-")
+                self.state.save_label(str(request.get("file", "")), mode, condition, group)
                 self.send_json({"ok": True})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)

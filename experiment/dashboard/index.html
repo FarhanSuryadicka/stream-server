@@ -42,7 +42,12 @@
     th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:650}
     th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}tbody tr{cursor:pointer}tbody tr:hover,tbody tr.active{background:#e8f2e9}
     .ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}.unknown{color:var(--amber)}
-    .label-editor{display:flex;gap:8px;align-items:end;margin-top:12px}.label-editor label{max-width:180px}.label-editor button{height:38px}
+    .label-editor{display:flex;gap:8px;align-items:end;margin-top:12px}.label-editor label{max-width:380px;flex:1}.label-editor button{height:38px}
+    /* Run ids behind a comparison average — wrap inside the nowrap table cell. */
+    .run-ids{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;white-space:normal;max-width:260px}
+    .run-ids span{font:11px ui-monospace,monospace;background:#eef2ea;color:var(--green);
+      border:1px solid var(--line);border-radius:6px;padding:1px 5px;cursor:pointer}
+    .run-ids span:hover{background:var(--mint)}
     .preview-wrap{position:relative;display:grid;place-items:center;min-height:260px;background:#101713;border-radius:12px;overflow:hidden}
     .preview-wrap img{display:block;width:100%;max-height:70vh;object-fit:contain;min-height:260px}
     .preview-note{position:absolute;left:12px;bottom:12px;padding:6px 9px;border-radius:8px;background:#07100dcc;color:#d8e9df;font-size:12px}
@@ -99,19 +104,26 @@
       <div class="chart-box"><h3>Observed packet loss (%)</h3><canvas id="lossChart"></canvas></div>
     </div>
     <div class="label-editor">
-      <label>Mode label<input id="labelMode" placeholder="320x240@20"></label>
-      <label>Condition label<input id="labelCondition" placeholder="clean"></label>
+      <label>Comparison group<input id="labelGroup" placeholder="tulis nama grup, mis. 720p uji ulang"></label>
       <button id="saveLabel" class="secondary">Save label</button>
     </div>
   </section>
 
   <section class="grid">
     <div class="panel"><div class="toolbar"><h2>Run history</h2><button id="refreshBtn" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Run</th><th>Mode</th><th>State</th><th>Frames</th><th>p50</th><th>p95</th><th>p99</th><th>Jitter</th><th>Loss</th></tr></thead><tbody id="runsBody"></tbody></table></div></div>
-    <div class="panel"><h2>Resolution comparison</h2><div class="table-wrap"><table><thead><tr><th>Mode / condition</th><th>Runs</th><th>p50 avg</th><th>p95 avg</th><th>p99 avg</th><th>Jitter avg</th><th>Loss avg</th><th>Goodput</th></tr></thead><tbody id="compareBody"></tbody></table></div><p class="hint">Perbandingan hanya memasukkan run valid. Gunakan ≥3 run per mode dan kondisi.</p></div>
+    <div class="panel"><h2>Resolution comparison</h2><div class="table-wrap"><table><thead><tr><th>Comparison group</th><th>Runs</th><th>Frames</th><th>p50 avg</th><th>p95 avg</th><th>p99 avg</th><th>Jitter avg</th><th>Loss avg</th><th>Goodput</th></tr></thead><tbody id="compareBody"></tbody></table></div><p class="hint">Run masuk ke sini hanya setelah diberi <b>Comparison group</b> lewat Save label — tidak otomatis saat run selesai. Rata-rata hanya menghitung run valid. Gunakan ≥3 run per grup.</p></div>
   </section>
 </main>
 <script>
   const $=id=>document.getElementById(id); let runs=[], selectedFile=null, selectedRun=null, cameraResolutions=[];
+  // While a session runs the charts must follow THAT run, not whatever row was
+  // last clicked — otherwise changing resolution mid-session leaves the graphs
+  // frozen on the previous run's file. Cleared when the session ends, so the
+  // operator can browse history again.
+  let activeFile=null, selectSeq=0;
+  // Which run's group label the input currently holds, so a 1 Hz refresh does
+  // not overwrite text being typed.
+  let labelShownFor=null;
   const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   async function api(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.statusText);return j}
   async function post(url,data={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
@@ -121,29 +133,123 @@
     const data=await api('/api/runs');runs=data.runs;$('resultsPath').textContent=data.results_dir;
     $('runsBody').innerHTML=runs.map(r=>`<tr data-file="${esc(r.file)}" class="${r.file===selectedFile?'active':''}"><td>${esc(r.run_id)}</td><td>${esc(r.mode)}</td><td class="${r.valid?'ok':r.clock_status==='RUNNING'?'unknown':'bad'}">${esc(r.clock_status)}</td><td>${r.frames}</td><td>${f(r.transport.p50)}</td><td>${f(r.transport.p95)}</td><td>${f(r.transport.p99)}</td><td>${f(r.jitter_ms)}</td><td>${f(r.loss_pct,3)}%</td></tr>`).join('');
     document.querySelectorAll('#runsBody tr').forEach(tr=>tr.onclick=()=>selectRun(tr.dataset.file));renderComparison();
-    if(!selectedFile&&runs.length)selectRun((runs.find(r=>r.valid)||runs[0]).file);
+    if(!activeFile&&!selectedFile&&runs.length)selectRun((runs.find(r=>r.valid)||runs[0]).file);
   }
-  async function selectRun(file){selectedFile=file;selectedRun=await api('/api/run?file='+encodeURIComponent(file));
+  async function selectRun(file){selectedFile=file;
+    // Poll and click can overlap; a slow read of a big NDJSON must not overwrite
+    // a newer selection when it finally lands.
+    const ticket=++selectSeq, run=await api('/api/run?file='+encodeURIComponent(file));
+    if(ticket!==selectSeq)return;
+    selectedRun=run;
     $('selectedTitle').textContent=`${selectedRun.run_id} · ${selectedRun.mode} · ${selectedRun.condition}`;
     $('validity').textContent=selectedRun.valid?'VALID RUN':selectedRun.clock_status;$('validity').className=selectedRun.valid?'ok':'bad';
     $('p50').textContent=f(selectedRun.transport.p50);$('p95').textContent=f(selectedRun.transport.p95);$('p99').textContent=f(selectedRun.transport.p99);
     $('jitter').textContent=f(selectedRun.jitter_ms);$('loss').textContent=f(selectedRun.loss_pct,3);$('goodput').textContent=f(selectedRun.goodput_mbps);
-    $('labelMode').value=selectedRun.mode==='unknown'?'':selectedRun.mode;$('labelCondition').value=selectedRun.condition==='unspecified'?'':selectedRun.condition;
+    // Show the group that belongs to THIS run. Keeping the previous run's text
+    // in the field meant a Save label after switching runs (e.g. a new capture
+    // mode) silently moved the label off the run it was written for, and the
+    // earlier run then vanished from the comparison. The field is left alone
+    // only while it has focus, so typing is still never interrupted.
+    if(labelShownFor!==file&&document.activeElement!==$('labelGroup')){
+      labelShownFor=file;$('labelGroup').value=selectedRun.group||''}
     drawCharts(selectedRun.series||[]);document.querySelectorAll('#runsBody tr').forEach(tr=>tr.classList.toggle('active',tr.dataset.file===file));
   }
-  function renderComparison(){const groups={};runs.filter(r=>r.valid).forEach(r=>{const k=`${r.mode} · ${r.condition}`;(groups[k]??=[]).push(r)});
-    $('compareBody').innerHTML=Object.entries(groups).sort().map(([k,a])=>`<tr><td>${esc(k)}</td><td>${a.length}</td><td>${f(avg(a.map(x=>x.transport.p50)))}</td><td>${f(avg(a.map(x=>x.transport.p95)))}</td><td>${f(avg(a.map(x=>x.transport.p99)))}</td><td>${f(avg(a.map(x=>x.jitter_ms)))}</td><td>${f(avg(a.map(x=>x.loss_pct)),3)}%</td><td>${f(avg(a.map(x=>x.goodput_mbps)))}</td></tr>`).join('')||'<tr><td colspan="8">No valid runs yet.</td></tr>'}
-  function drawMetric(id,series,key,color,floorMax,decimals){const c=$(id),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*ratio;c.height=h*ratio;const x=c.getContext('2d');x.scale(ratio,ratio);x.clearRect(0,0,w,h);x.fillStyle='#fff';x.fillRect(0,0,w,h);if(!series.length){x.fillStyle='#66736b';x.fillText('Menunggu frame...',16,26);return}const vals=series.map(p=>Number(p[key]||0)),max=Math.max(floorMax,...vals)*1.08,pad={l:43,r:12,t:12,b:24};x.strokeStyle='#e0e4dc';x.fillStyle='#66736b';x.font='10px Segoe UI';for(let i=0;i<=4;i++){const y=pad.t+(h-pad.t-pad.b)*i/4;x.beginPath();x.moveTo(pad.l,y);x.lineTo(w-pad.r,y);x.stroke();x.fillText((max*(1-i/4)).toFixed(decimals),4,y+3)}x.strokeStyle=color;x.lineWidth=1.7;x.beginPath();vals.forEach((v,i)=>{const px=pad.l+(w-pad.l-pad.r)*i/(vals.length-1||1),py=pad.t+(h-pad.t-pad.b)*(1-v/max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle='#66736b';x.fillText('frame ->',w-55,h-7)}
+  // Only runs the operator explicitly labelled with a comparison group appear
+  // here. A finished run is NOT added on its own: which runs belong in a
+  // comparison is a judgement call (bring-up runs, aborted runs and retries all
+  // finish cleanly but must not be averaged in), so it stays a manual step.
+  //
+  // Averages count VALID runs only — a run still streaming has no summary line,
+  // so its clock drift is unverified and it must not enter a comparison figure.
+  // The group ROW is still listed while that run is in flight, with the pending
+  // count shown: dropping the row entirely made a saved label look lost.
+  function renderComparison(){const groups={};
+    runs.filter(r=>r.group).forEach(r=>{const g=groups[r.group]??={valid:[],pending:0};
+      r.valid?g.valid.push(r):(r.clock_status==='RUNNING'&&g.pending++)});
+    const rows=Object.entries(groups).filter(([,g])=>g.valid.length||g.pending).sort();
+    // Name the runs behind each average. A bare count ("1") cannot be traced
+    // back to Run history, which is where the operator checks what was measured.
+    const idsOf=a=>`<div class="run-ids">${a.map(x=>`<span data-file="${esc(x.file)}">${esc(x.run_id)}</span>`).join(' ')}</div>`;
+    $('compareBody').innerHTML=rows.map(([k,g])=>{const a=g.valid,note=g.pending?` <small style="color:var(--amber)">+${g.pending} berjalan</small>`:'';
+      if(!a.length)return `<tr><td>${esc(k)}${note}</td><td>0</td><td colspan="7" style="text-align:left;color:var(--muted)">menunggu run selesai…</td></tr>`;
+      // Total frames across the group, matching what Run history reports per run.
+      const frames=a.reduce((s,x)=>s+x.frames,0);
+      return `<tr><td>${esc(k)}${note}${idsOf(a)}</td><td>${a.length}</td><td>${frames}</td><td>${f(avg(a.map(x=>x.transport.p50)))}</td><td>${f(avg(a.map(x=>x.transport.p95)))}</td><td>${f(avg(a.map(x=>x.transport.p99)))}</td><td>${f(avg(a.map(x=>x.jitter_ms)))}</td><td>${f(avg(a.map(x=>x.loss_pct)),3)}%</td><td>${f(avg(a.map(x=>x.goodput_mbps)))}</td></tr>`}).join('')||'<tr><td colspan="9">Belum ada run yang diberi label. Pilih run, tulis Comparison group, lalu Save label.</td></tr>';
+    // Clicking a run id selects that run, so a suspicious average can be opened
+    // immediately instead of hunting for the id in the history table.
+    document.querySelectorAll('#compareBody .run-ids span').forEach(el=>el.onclick=()=>selectRun(el.dataset.file));}
+  // Nice round tick step for a time axis: 1/2/5 x 10^n seconds, so labels land
+  // on values an operator can reason about ("at 20 s") instead of arbitrary ones.
+  function timeStep(span,target=5){const raw=span/target,mag=10**Math.floor(Math.log10(raw||1)),n=raw/mag;
+    return (n<1.5?1:n<3.5?2:n<7.5?5:10)*mag}
+  function drawMetric(id,series,key,color,floorMax,decimals){const c=$(id),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*ratio;c.height=h*ratio;const x=c.getContext('2d');x.scale(ratio,ratio);x.clearRect(0,0,w,h);x.fillStyle='#fff';x.fillRect(0,0,w,h);if(!series.length){x.fillStyle='#66736b';x.fillText('Menunggu frame...',16,26);return}
+    const vals=series.map(p=>Number(p[key]||0)),max=Math.max(floorMax,...vals)*1.08,pad={l:43,r:12,t:12,b:30};
+    const plotW=w-pad.l-pad.r,plotH=h-pad.t-pad.b;
+    // X in seconds. Older logs (parsed before "t" existed) have no timestamp, so
+    // fall back to frame index and label the axis accordingly.
+    const hasT=series[0].t!==undefined,ts=series.map((p,i)=>hasT?Number(p.t||0):i);
+    const tMax=Math.max(...ts),tMin=Math.min(...ts),span=tMax-tMin||1;
+    const px=i=>pad.l+plotW*(ts[i]-tMin)/span;
+    x.strokeStyle='#e0e4dc';x.fillStyle='#66736b';x.font='10px Segoe UI';x.textAlign='left';
+    for(let i=0;i<=4;i++){const y=pad.t+plotH*i/4;x.beginPath();x.moveTo(pad.l,y);x.lineTo(w-pad.r,y);x.stroke();x.fillText((max*(1-i/4)).toFixed(decimals),4,y+3)}
+    // Vertical gridlines + tick labels on the time axis.
+    x.textAlign='center';
+    if(hasT){const step=timeStep(span);
+      for(let t=Math.ceil(tMin/step)*step;t<=tMax+1e-9;t+=step){const gx=pad.l+plotW*(t-tMin)/span;
+        x.strokeStyle='#eef1ea';x.beginPath();x.moveTo(gx,pad.t);x.lineTo(gx,pad.t+plotH);x.stroke();
+        x.strokeStyle='#c9cfc4';x.beginPath();x.moveTo(gx,pad.t+plotH);x.lineTo(gx,pad.t+plotH+4);x.stroke();
+        x.fillStyle='#66736b';x.fillText(`${step<1?t.toFixed(1):Math.round(t)}s`,gx,h-9)}}
+    x.strokeStyle=color;x.lineWidth=1.7;x.beginPath();
+    vals.forEach((v,i)=>{const py=pad.t+plotH*(1-v/max);i?x.lineTo(px(i),py):x.moveTo(px(i),py)});x.stroke();
+    // Only the index-based fallback needs an axis caption; the "s" suffix on the
+    // time ticks already says what the axis is, and the caption collided with
+    // the right-most tick.
+    if(!hasT){x.fillStyle='#66736b';x.textAlign='right';x.fillText('frame →',w-pad.r,h-9);x.textAlign='left'}}
   function drawCharts(series){drawMetric('latencyChart',series,'latency','#397f91',5,0);drawMetric('jitterChart',series,'jitter','#d7913d',1,1);drawMetric('lossChart',series,'loss','#b44b4b',.1,2)}
-  async function pollSession(){try{const s=await api('/api/session');$('sessionState').textContent=s.state;$('sessionState').className=s.state==='complete'?'ok':s.state==='failed'?'bad':'unknown';$('console').textContent=(s.output||[]).join('\n')||'No active session.';$('console').scrollTop=$('console').scrollHeight;$('startBtn').disabled=['starting','running'].includes(s.state);$('stopBtn').disabled=!['starting','running'].includes(s.state);const p=s.preview||{status:'idle'};$('previewState').textContent=p.status;$('previewState').className=p.status==='live'?'ok':p.status==='error'?'bad':'unknown';$('previewNote').textContent=p.error||({idle:'Preview muncul setelah receiver dijalankan.',waiting:'Menunggu frame H.264 dari HP...',live:'LIVE - H.264 -> MJPEG',stopped:'Run selesai - menampilkan frame terakhir'}[p.status]||p.status);if(s.run_id&&['starting','running'].includes(s.state))$('runId').value=s.run_id;if(s.state==='complete'&&pollSession.last!==s.exit_code+':'+s.run_id){pollSession.last=s.exit_code+':'+s.run_id;refreshRuns()}}catch(e){$('console').textContent=e.message}}
+  async function pollSession(){try{const s=await api('/api/session');$('sessionState').textContent=s.state;$('sessionState').className=s.state==='complete'?'ok':s.state==='failed'?'bad':'unknown';$('console').textContent=(s.output||[]).join('\n')||'No active session.';$('console').scrollTop=$('console').scrollHeight;$('startBtn').disabled=['starting','running'].includes(s.state);$('stopBtn').disabled=!['starting','running'].includes(s.state);const p=s.preview||{status:'idle'};$('previewState').textContent=p.status;$('previewState').className=p.status==='live'?'ok':p.status==='error'?'bad':'unknown';$('previewNote').textContent=p.error||({idle:'Preview muncul setelah receiver dijalankan.',waiting:'Menunggu frame H.264 dari HP...',live:'LIVE - H.264 -> MJPEG',stopped:'Run selesai - menampilkan frame terakhir'}[p.status]||p.status);const live=['starting','running'].includes(s.state);if(s.run_id&&live)$('runId').value=s.run_id;
+    // Follow the running receiver's own file. Selection by click is not
+    // reliable here: a run can start without Start being pressed on this page,
+    // and the history table only refreshes every 5 s, so it may not list the
+    // new file yet. Deriving the name from run_id matches how the receiver
+    // names its output and needs no table entry.
+    activeFile=live&&s.run_id?`receiver-${s.run_id}.ndjson`:null;
+    if(activeFile&&activeFile!==pollSession.lastActive){pollSession.lastActive=activeFile;selectedFile=activeFile;refreshRuns().catch(()=>{})}
+    // A finished run must stay on screen: keep reading its file so the charts
+    // show the completed measurement instead of a stale "waiting" placeholder.
+    if(!live){pollSession.lastActive=null;if(s.run_id)selectedFile??=`receiver-${s.run_id}.ndjson`}
+    if(s.state==='complete'&&pollSession.last!==s.exit_code+':'+s.run_id){pollSession.last=s.exit_code+':'+s.run_id;refreshRuns()}}catch(e){$('console').textContent=e.message}}
   $('startBtn').onclick=async()=>{try{const s=await post('/api/start',{phone:$('phone').value,protocol:$('protocol').value,run_id:$('runId').value,mode:$('mode').value,condition:'clean',duration:+$('duration').value,warmup:+$('warmup').value});$('runId').value=s.run_id;selectedFile=`receiver-${s.run_id}.ndjson`;pollSession()}catch(e){alert(e.message)}};
   function updateExactMode(){const item=cameraResolutions[+$('resolution').value],fps=item?.fps?.[0];$('mode').value=item&&fps?`${item.width}x${item.height}@${fps}`:'';if(item&&fps)$('modesState').textContent=`Selected: ${item.width} x ${item.height} - FPS auto (${fps}, tertinggi yang didukung kamera).`}
   async function refreshModes(showError=true){const b=$('modesBtn');b.disabled=true;$('modesState').textContent='Membaca descriptor MJPEG dari kamera HP...';try{const data=await api('/api/modes?phone='+encodeURIComponent($('phone').value));cameraResolutions=data.resolutions;const preferredResolution=data.recommended.split('@')[0];$('resolution').innerHTML=cameraResolutions.map((m,i)=>`<option value="${i}" ${`${m.width}x${m.height}`===preferredResolution?'selected':''}>${m.width} x ${m.height}</option>`).join('');updateExactMode();}catch(e){cameraResolutions=[];$('resolution').innerHTML='<option value="">Camera agent unavailable</option>';$('mode').value='';$('modesState').textContent=e.message;if(showError)alert(e.message)}finally{b.disabled=false}}
   $('resolution').onchange=updateExactMode;
   $('modesBtn').onclick=()=>refreshModes(true);
   $('stopBtn').onclick=()=>post('/api/stop').catch(e=>alert(e.message));$('refreshBtn').onclick=refreshRuns;
-  $('saveLabel').onclick=async()=>{if(!selectedFile)return;try{await post('/api/label',{file:selectedFile,mode:$('labelMode').value||'unknown',condition:$('labelCondition').value||'unspecified'});await refreshRuns();await selectRun(selectedFile)}catch(e){alert(e.message)}};
-  async function refreshActive(){if(!selectedFile)return;try{await selectRun(selectedFile)}catch(e){}}
+  $('saveLabel').onclick=async()=>{
+    // Label the run whose numbers are actually on screen. selectedFile alone is
+    // wrong during a session: refreshActive() displays activeFile, so saving by
+    // selectedFile could write the label onto a different run than the operator
+    // is looking at.
+    const f=selectedRun?.file||activeFile||selectedFile;if(!f)return;
+    // mode/condition are omitted on purpose: they come from the receiver's own
+    // NDJSON metadata and are no longer operator-editable.
+    try{await post('/api/label',{file:f,group:$('labelGroup').value||''});labelShownFor=null;await refreshRuns();await selectRun(f)}catch(e){alert(e.message)}};
+  // A run in progress wins over the clicked row, so the charts always show the
+  // stream that is actually flowing.
+  async function refreshActive(){const file=activeFile||selectedFile;if(!file)return;
+    try{await selectRun(file)}
+    catch(e){
+      // The receiver has not created the NDJSON yet (404 for the first second
+      // or so of a run). Showing the previous run's numbers under the new run's
+      // name would be a misread, so blank the panel until real frames land.
+      // Only while that file is still the pending one — a later successful read
+      // replaces this, so the placeholder can never get stuck.
+      if(file===activeFile&&selectedRun?.file!==file)showPending(file);
+    }}
+  function showPending(file){selectedRun=null;
+    $('selectedTitle').textContent=`${file.replace(/^receiver-|\.ndjson$/g,'')} · menunggu frame…`;
+    $('validity').textContent='STARTING';$('validity').className='unknown';
+    ['p50','p95','p99','jitter','loss','goodput'].forEach(k=>$(k).textContent='—');
+    drawCharts([]);}
   addEventListener('resize',()=>selectedRun&&drawCharts(selectedRun.series||[]));refreshRuns();pollSession();setInterval(()=>{pollSession();refreshActive()},1000);setInterval(refreshRuns,5000);
 </script>
 </body>
