@@ -30,7 +30,8 @@ class NdjsonWriter {
   void WriteFrame(uint32_t seq, uint64_t cap_ns, uint64_t enc_ns,
                   uint64_t snd_ns, uint64_t rcv_ns, uint32_t bytes,
                   bool keyframe, uint64_t packets_received = 0,
-                  uint64_t packets_lost = 0);
+                  uint64_t packets_lost = 0,
+                  uint64_t packets_recovered = 0);
 
   void WriteControl(uint64_t sent, uint64_t acked, double p50_ms,
                     double p95_ms, double p99_ms, double max_ms);
@@ -43,7 +44,8 @@ class NdjsonWriter {
                     uint64_t packets_received = 0,
                     uint64_t packets_lost = 0,
                     uint64_t packet_reorder_events = 0,
-                    uint64_t packet_duplicates = 0);
+                    uint64_t packet_duplicates = 0,
+                    uint64_t packets_recovered = 0);
 
   void Close();
 

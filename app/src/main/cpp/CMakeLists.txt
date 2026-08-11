@@ -7,6 +7,18 @@ set(LIBUSB_BUILD_EXAMPLES OFF)
 set(LIBUSB_BUILD_TESTING OFF)
 add_subdirectory(libusb-cmake)
 
+# SRT v1.5.6, vendored from the official Haivision repository. The first
+# comparison profile is deliberately unencrypted; encryption and its crypto
+# backend are a separate variable and must not silently change transport cost.
+set(ENABLE_APPS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+set(ENABLE_ENCRYPTION OFF CACHE BOOL "" FORCE)
+set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
+set(ENABLE_STDCXX_SYNC ON CACHE BOOL "" FORCE)
+add_subdirectory(srt EXCLUDE_FROM_ALL)
+
 # Native JPEG codec for the dewarp pipeline (decode camera MJPEG -> RGB,
 # encode dewarped RGB -> JPEG) — replaces the earlier Kotlin/Bitmap JNI
 # round-trip so decode/encode run in C alongside the GLES render, no per-
@@ -176,6 +188,7 @@ add_library(uvcserver SHARED
     ucv_transport.c
     ucv_transport_mjpeg.c
     ucv_transport_rtp.c
+    ucv_transport_srt.c
     ucv_control.c
     ucv_encoder.c
     ucv_pipeline.c
@@ -186,6 +199,9 @@ add_library(uvcserver SHARED
 target_include_directories(uvcserver
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../experiment/receiver/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/srt/srtcore
+        ${CMAKE_CURRENT_SOURCE_DIR}/srt/common
+        ${CMAKE_CURRENT_BINARY_DIR}/srt
 )
 target_link_libraries(uvcserver
     PRIVATE
@@ -194,6 +210,7 @@ target_link_libraries(uvcserver
         log
         m
         jpeg-static
+        srt_static
         # MediaCodec via the NDK, so capture -> decode -> encode -> transport
         # all run in native code on one clock (see ucv_encoder.h).
         mediandk

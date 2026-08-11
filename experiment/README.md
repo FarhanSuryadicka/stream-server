@@ -89,9 +89,9 @@ competing for isochronous USB bandwidth.
   56/32/40 bytes so a padding change breaks the build instead of silently
   corrupting measurements
 - Clock synchronisation (SNTP-style, 64 probes, lowest-RTT wins)
-- Android: Raw UDP, RFC 6184 RTP/UDP, instrumented MJPEG transport, control
-  channel, encoder, and shared pipeline
-- PC: `ucv-receiver` — Raw UDP/RTP receive and reassembly, packet loss,
+- Android: Raw UDP, RFC 6184 RTP/UDP, SRT live/message, instrumented MJPEG
+  transport, control channel, encoder, and shared pipeline
+- PC: `ucv-receiver` — Raw UDP/RTP/SRT receive and reassembly, packet loss,
   MJPEG/TCP retransmission-rate, jitter accounting, control-RTT-under-load,
   NDJSON logging
 - `ucv-selftest` (34 checks) and `ucv-nv12test` — both passing
@@ -101,7 +101,7 @@ competing for isochronous USB bandwidth.
 
 **Not built yet:**
 
-- SRT, WebRTC, RTMPS, and HLS transports (stubs return NULL, deliberately)
+- WebRTC, RTMPS, and HLS transports (stubs return NULL, deliberately)
 - RTSP signalling for the implemented RTP/UDP data plane
 
 ### Status: ready for on-device bring-up
@@ -155,9 +155,8 @@ the `ucv_transport_t` interface, so a protocol cannot accidentally be measured
 with a different encoder config — the failure mode the issue explicitly warns
 about.
 
-**Unimplemented protocols return NULL, never a fallback.** A run labelled `srt`
-whose bytes actually went over plain UDP is the most damaging thing that could
-happen to these results.
+**Unimplemented protocols return NULL, never a fallback.** A protocol label
+must always describe the transport that actually carried its bytes.
 
 **The receiver aborts when clock sync fails.** Without an offset estimate,
 `t_received - t_sent` measures clock skew, not latency. Verified: it refuses to

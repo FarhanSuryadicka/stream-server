@@ -254,6 +254,19 @@ sequence-gap analysis cannot see a tail-end loss:
 | `8204` | HLS/DASH HTTP |
 | `5004` | RTP/UDP H.264 data plane |
 
+### SRT payload profile
+
+SRT uses caller mode on the phone and listener mode on the PC. It runs in
+live/message mode on port 8202 with an explicit 20 ms latency and late-packet
+drop enabled. A message contains exactly one common 56-byte UCV frame header
+followed by at most 1200 bytes of H.264 data. `fragment_index` and
+`fragment_count` therefore use the same reassembly contract as Raw UDP.
+
+The initial profile has encryption disabled. Receiver loss uses libsrt's
+native packet statistics: `packets_lost` means packets detected missing, while
+`packets_recovered` records retransmitted packets received. These are distinct
+from final frame gaps.
+
 Control is a **dedicated port for every protocol**, including those with a
 native back-channel. That keeps the control measurement methodology identical
 across protocols; where a native channel exists (WebRTC data channel), it is

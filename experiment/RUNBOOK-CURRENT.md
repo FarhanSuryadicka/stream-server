@@ -454,6 +454,13 @@ menampilkan **Observed RTP packet loss** realtime. Pilihan `RTP/UDP (H.264)`
 saat ini menguji data plane langsung pada UDP 5004. Ia belum menjalankan RTSP
 `DESCRIBE/SETUP/PLAY`, sehingga hasil harus diberi nama RTP/UDP, bukan RTSP.
 
+Untuk **SRT**, pilih `SRT (H.264, 20 ms)`. HP bertindak sebagai caller dan PC
+sebagai listener di port 8202. Dashboard menampilkan **SRT detected packet
+loss** dari statistik native libsrt. NDJSON juga menyimpan
+`packets_recovered`, yaitu paket retransmisi yang berhasil diterima. Karena itu
+detected loss dapat lebih besar dari final frame loss. Profil awal memakai
+live/message mode, latency 20 ms, dan encryption off.
+
 ### Statistik lain yang tetap dicatat
 
 Walaupun grafik utama fokus pada latency, jitter, dan loss, NDJSON masih

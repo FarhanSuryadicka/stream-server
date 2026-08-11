@@ -11,7 +11,7 @@ to be measured; the "Status" column says exactly what exists.
 |---|---|---|---|---|
 | 4 | Raw UDP | ✅ implemented, compiled | ✅ implemented, tested E2E | ✅ **yes — ready to measure on-device** |
 | 5 | MJPEG/HTTP | ✅ camera JPEG passthrough, compiled | ✅ HTTP multipart reader, compiled | ⚠️ needs on-device validation |
-| 2 | SRT | ⛔ stub | ⛔ | ❌ needs libsrt |
+| 2 | SRT | ✅ libsrt caller, compiled | ✅ libsrt listener, compiled | ⚠️ needs on-device validation |
 | 3 | RTP/UDP data plane | ✅ RFC 6184 sender | ✅ measured receiver | ⚠️ RTSP signalling pending |
 | 1 | WebRTC | ⛔ stub | ⛔ | ❌ needs libdatachannel |
 | 6 | RTMPS | ⛔ stub | ⛔ | ❌ needs librtmp + server |
@@ -138,20 +138,20 @@ capture and cannot be inferred from HTTP.
 
 ## 4. SRT — protocol #2
 
-**Library:** [libsrt](https://github.com/Haivision/srt) — vendor into
-`app/src/main/cpp/srt/`, same pattern as libuvc.
+**Status: implemented; physical-device validation remains.** Official libsrt
+v1.5.6 is vendored at `app/src/main/cpp/srt/`. The phone is the caller and the
+PC receiver is the listener on UDP port 8202.
 
-Notes that will cost time if discovered late:
-- libsrt needs a crypto backend for AES. Bundle **mbedTLS** (smallest NDK
-  footprint) rather than OpenSSL.
-- Configure `SRTO_LATENCY` explicitly and **log it** — it is the single
-  biggest determinant of SRT's measured latency, and leaving it at default
-  while another protocol is tuned is exactly the unfair comparison §2 of the
-  harness spec warns about. Measure at 20/50/120 ms and report all three.
-- Caller/listener: phone = caller, PC = listener.
-- PC side: `srt-live-transmit`, or link libsrt into the receiver.
+The initial reproducible profile uses live/message mode,
+`SRTO_LATENCY=20 ms`, late-packet drop enabled, and encryption disabled. Each
+1200-byte H.264 fragment is one SRT message with the common 56-byte measurement
+header. The receiver records SRT packets received, packets detected missing,
+and retransmitted packets received. A later fair-comparison matrix may add
+explicit 50/120 ms profiles; it must never silently use a library default.
 
-**Estimate: 3–5 days** including cross-compiling mbedTLS for arm64.
+Encryption is deliberately **off** in this first profile. Enabling AES remains
+separate work requiring a crypto backend and must be measured as a different
+profile.
 
 ---
 

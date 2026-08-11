@@ -18,6 +18,7 @@
 #include "ucv_stats.h"
 #include "ucv_net.h"
 #include "ucv_log.h"
+#include <srt.h>
 
 #include <atomic>
 #include <chrono>
@@ -59,7 +60,7 @@ void PrintUsage(const char* argv0) {
       "Usage: %s --phone <ip> [options]\n"
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
-      "  --protocol <name>     raw_udp | rtp_udp | mjpeg  (default: raw_udp)\n"
+      "  --protocol <name>     raw_udp | rtp_udp | srt | mjpeg  (default: raw_udp)\n"
       "  --video-port <n>      Video port      (default: protocol default)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
@@ -118,6 +119,8 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     o->video_port = UCV_PORT_MJPEG;
   if (o->protocol == "rtp_udp" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_RTP;
+  if (o->protocol == "srt" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_SRT;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -511,6 +514,84 @@ class MjpegReader {
   bool response_done_ = false;
 };
 
+class SrtReceiver {
+ public:
+  ~SrtReceiver() { Close(); }
+
+  bool Listen(int port) {
+    if (srt_startup() == SRT_ERROR) return false;
+    listener_ = srt_create_socket();
+    if (listener_ == SRT_INVALID_SOCK) return false;
+    SRT_TRANSTYPE type = SRTT_LIVE;
+    int yes = 1, no = 0, latency = 20;
+    int payload = UCV_FRAME_HEADER_SIZE + UCV_UDP_FRAGMENT_PAYLOAD;
+    if (!Set(listener_, SRTO_TRANSTYPE, &type, sizeof(type)) ||
+        !Set(listener_, SRTO_MESSAGEAPI, &yes, sizeof(yes)) ||
+        !Set(listener_, SRTO_TLPKTDROP, &yes, sizeof(yes)) ||
+        !Set(listener_, SRTO_LATENCY, &latency, sizeof(latency)) ||
+        !Set(listener_, SRTO_PAYLOADSIZE, &payload, sizeof(payload)) ||
+        !Set(listener_, SRTO_RCVSYN, &no, sizeof(no))) return false;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    return srt_bind(listener_, reinterpret_cast<sockaddr*>(&address),
+                    sizeof(address)) != SRT_ERROR &&
+           srt_listen(listener_, 1) != SRT_ERROR;
+  }
+
+  bool Accept(int timeout_ms) {
+    const auto end = std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < end) {
+      sockaddr_storage peer{};
+      int peer_size = sizeof(peer);
+      socket_ = srt_accept(listener_, reinterpret_cast<sockaddr*>(&peer),
+                           &peer_size);
+      if (socket_ != SRT_INVALID_SOCK) {
+        int timeout = 200;
+        Set(socket_, SRTO_RCVTIMEO, &timeout, sizeof(timeout));
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+  }
+
+  int Recv(void* data, int bytes) {
+    const int result = srt_recvmsg(socket_, static_cast<char*>(data), bytes);
+    if (result != SRT_ERROR) return result;
+    const int code = srt_getlasterror(nullptr);
+    return code == SRT_ETIMEOUT || code == SRT_EASYNCRCV ? 0 : -1;
+  }
+
+  bool Stats(uint64_t* received, uint64_t* lost, uint64_t* retransmitted) {
+    SRT_TRACEBSTATS stats{};
+    if (socket_ == SRT_INVALID_SOCK || srt_bstats(socket_, &stats, 0) == SRT_ERROR)
+      return false;
+    *received = static_cast<uint64_t>(std::max<int64_t>(0, stats.pktRecvTotal));
+    *lost = static_cast<uint64_t>(std::max(0, stats.pktRcvLossTotal));
+    *retransmitted = static_cast<uint64_t>(
+        std::max(0, stats.pktRcvRetrans));
+    return true;
+  }
+
+  void Close() {
+    if (socket_ != SRT_INVALID_SOCK) srt_close(socket_);
+    if (listener_ != SRT_INVALID_SOCK) srt_close(listener_);
+    socket_ = listener_ = SRT_INVALID_SOCK;
+    srt_cleanup();
+  }
+
+ private:
+  static bool Set(SRTSOCKET socket, SRT_SOCKOPT option,
+                  const void* value, int size) {
+    return srt_setsockflag(socket, option, value, size) != SRT_ERROR;
+  }
+  SRTSOCKET listener_ = SRT_INVALID_SOCK;
+  SRTSOCKET socket_ = SRT_INVALID_SOCK;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -581,6 +662,7 @@ int main(int argc, char** argv) {
   ucv::UdpSocket video;
   ucv::UdpSender preview;
   MjpegReader mjpeg;
+  SrtReceiver srt;
   if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp") {
     if (!video.Bind(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot bind UDP :%d\n", opt.video_port);
@@ -595,6 +677,17 @@ int main(int argc, char** argv) {
       opt.preview_port = 0;
     }
   } else if (opt.protocol == "mjpeg") {
+    if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
+      std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
+                   opt.preview_port);
+      opt.preview_port = 0;
+    }
+  } else if (opt.protocol == "srt") {
+    if (!srt.Listen(opt.video_port)) {
+      std::fprintf(stderr, "fatal: cannot listen for SRT on :%d: %s\n",
+                   opt.video_port, srt_getlasterror_str());
+      return 1;
+    }
     if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
       std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
                    opt.preview_port);
@@ -621,7 +714,8 @@ int main(int argc, char** argv) {
       return 2;
     }
     const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
-        (opt.protocol == "rtp_udp" ? UCV_PROTO_RTSP : UCV_PROTO_RAWUDP);
+        (opt.protocol == "rtp_udp" ? UCV_PROTO_RTSP :
+         (opt.protocol == "srt" ? UCV_PROTO_SRT : UCV_PROTO_RAWUDP));
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
                                 protocol_id, opt.video_port)) {
@@ -649,6 +743,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     std::printf("[recv] connected to MJPEG HTTP stream\n");
+  } else if (opt.protocol == "srt") {
+    if (!srt.Accept(5000)) {
+      std::fprintf(stderr, "fatal: phone did not connect to SRT listener: %s\n",
+                   srt_getlasterror_str());
+      if (opt.remote_phone) control.StopRemoteRun();
+      return 2;
+    }
+    std::printf("[recv] SRT connected (live/message, latency=20ms, encryption=off)\n");
   }
 
   // ------------------------------------------------------------------
@@ -691,6 +793,9 @@ int main(int argc, char** argv) {
   uint64_t tcp_segments = 0, tcp_retrans = 0;
   uint64_t tcp_base_segments = 0, tcp_base_retrans = 0;
   bool tcp_baseline = false, tcp_stats_available = false;
+  uint64_t srt_received = 0, srt_lost = 0, srt_retransmitted = 0;
+  uint64_t srt_base_received = 0, srt_base_lost = 0, srt_base_retransmitted = 0;
+  bool srt_baseline = false;
   const uint32_t expected_run_hash = ucv_run_id_hash(opt.run_id.c_str());
 
   const auto t_start   = std::chrono::steady_clock::now();
@@ -758,7 +863,9 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    int n = video.RecvTimeout(buf.data(), buf.size(), 200);
+    int n = opt.protocol == "srt"
+        ? srt.Recv(buf.data(), static_cast<int>(buf.size()))
+        : video.RecvTimeout(buf.data(), buf.size(), 200);
     if (n <= 0) continue;
 
     const uint64_t t_recv = ucv::NowNs();
@@ -775,8 +882,10 @@ int main(int argc, char** argv) {
         bad_header++; continue;
       }
       std::memcpy(&h, buf.data(), sizeof(h));
+      const uint16_t expected_protocol = opt.protocol == "srt"
+          ? UCV_PROTO_SRT : UCV_PROTO_RAWUDP;
       if (!ucv_frame_header_valid(&h) ||
-          h.protocol_id != UCV_PROTO_RAWUDP) { bad_header++; continue; }
+          h.protocol_id != expected_protocol) { bad_header++; continue; }
     }
 
     // A stale sender from a previous run would otherwise silently pollute
@@ -787,8 +896,23 @@ int main(int argc, char** argv) {
       bad_header++;
       continue;
     }
-    if (std::chrono::steady_clock::now() >= t_warmup)
+    const bool measurement_window = std::chrono::steady_clock::now() >= t_warmup;
+    if (measurement_window && opt.protocol != "srt")
       packets.Observe(h.packet_seq);
+    if (measurement_window && opt.protocol == "srt") {
+      uint64_t received = 0, lost = 0, retransmitted = 0;
+      if (srt.Stats(&received, &lost, &retransmitted)) {
+        if (!srt_baseline) {
+          srt_base_received = received;
+          srt_base_lost = lost;
+          srt_base_retransmitted = retransmitted;
+          srt_baseline = true;
+        }
+        srt_received = received - srt_base_received;
+        srt_lost = lost - srt_base_lost;
+        srt_retransmitted = retransmitted - srt_base_retransmitted;
+      }
+    }
 
     bytes_wire += static_cast<uint64_t>(n);
 
@@ -831,14 +955,23 @@ int main(int argc, char** argv) {
 
     log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
                    f.t_recv_ns, f.bytes, f.keyframe,
-                   packets.received(), packets.missing());
+                   opt.protocol == "srt" ? srt_received : packets.received(),
+                   opt.protocol == "srt" ? srt_lost : packets.missing(),
+                   opt.protocol == "srt" ? srt_retransmitted : 0);
 
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report >= std::chrono::seconds(5)) {
+      const uint64_t received_packets = opt.protocol == "srt"
+          ? srt_received : packets.received();
+      const uint64_t lost_packets = opt.protocol == "srt"
+          ? srt_lost : packets.missing();
+      const double live_loss = received_packets + lost_packets
+          ? 100.0 * static_cast<double>(lost_packets) /
+                (received_packets + lost_packets) : 0.0;
       std::printf("[recv] %6llu frames  transport p50=%.1f ms  jitter=%.2f ms  packet_loss=%.3f%%\n",
                   static_cast<unsigned long long>(frames_in_window),
                   transport_ms.Percentile(0.50), jitter.jitter_ms(),
-                  packets.loss_pct());
+                  live_loss);
       last_report = now;
     }
   }
@@ -918,6 +1051,17 @@ int main(int argc, char** argv) {
                 packets.loss_pct(),
                 static_cast<unsigned long long>(packets.reorder_events()),
                 static_cast<unsigned long long>(packets.duplicates()));
+  } else if (opt.protocol == "srt") {
+    const uint64_t attempts = srt_received + srt_lost;
+    const double loss = attempts
+        ? 100.0 * static_cast<double>(srt_lost) / attempts : 0.0;
+    std::printf("  SRT packets recv   %llu\n"
+                "  SRT detected lost  %llu (%.3f %%)\n"
+                "  SRT retransmitted  %llu\n"
+                "  SRT profile        live/message, latency=20ms, encryption=off\n",
+                static_cast<unsigned long long>(srt_received),
+                static_cast<unsigned long long>(srt_lost), loss,
+                static_cast<unsigned long long>(srt_retransmitted));
   } else if (opt.protocol == "mjpeg") {
     const uint64_t tcp_attempts = tcp_segments + tcp_retrans;
     const double tcp_loss = tcp_attempts
@@ -985,17 +1129,17 @@ int main(int argc, char** argv) {
               "    counts application bytes only and cannot see retransmits.\n");
 
   const bool udp_protocol = opt.protocol == "raw_udp" || opt.protocol == "rtp_udp";
-  const uint64_t summary_packets_received = udp_protocol
-      ? packets.received()
-      : tcp_segments;
-  const uint64_t summary_packets_lost = udp_protocol
-      ? packets.missing() : tcp_retrans;
+  const uint64_t summary_packets_received = opt.protocol == "srt"
+      ? srt_received : (udp_protocol ? packets.received() : tcp_segments);
+  const uint64_t summary_packets_lost = opt.protocol == "srt"
+      ? srt_lost : (udp_protocol ? packets.missing() : tcp_retrans);
   log.WriteSummary(seq.received(), seq.gap_frames(), seq.reorder_events(),
                    seq.duplicates(), reassembly_failures, bytes_payload, bytes_wire,
                    have_after ? sync_after.offset_ns : 0, drift_ns,
                    clock_suspect || !have_after,
                    summary_packets_received, summary_packets_lost,
-                   packets.reorder_events(), packets.duplicates());
+                   packets.reorder_events(), packets.duplicates(),
+                   opt.protocol == "srt" ? srt_retransmitted : 0);
   log.Close();
 
   std::printf("\nlog written: %s/receiver-%s.ndjson\n",

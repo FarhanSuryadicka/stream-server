@@ -4,6 +4,16 @@ project(ucv_receiver CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(ENABLE_APPS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+set(ENABLE_ENCRYPTION OFF CACHE BOOL "" FORCE)
+set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
+set(ENABLE_STDCXX_SYNC ON CACHE BOOL "" FORCE)
+set(SRT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../app/src/main/cpp/srt)
+add_subdirectory(${SRT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/srt EXCLUDE_FROM_ALL)
+
 if(NOT CMAKE_BUILD_TYPE)
   # Measurement code compiled -O0 would add its own latency to the numbers it
   # reports, so Release is the default rather than an opt-in.
@@ -15,6 +25,12 @@ add_executable(ucv-receiver
     src/ucv_net.cpp
     src/ucv_log.cpp
 )
+target_include_directories(ucv-receiver PRIVATE
+    ${SRT_SOURCE_DIR}/srtcore
+    ${SRT_SOURCE_DIR}/common
+    ${CMAKE_BINARY_DIR}/srt
+)
+target_link_libraries(ucv-receiver PRIVATE srt_static)
 
 # Verifies the measurement primitives: wire layout, CRC rejection, clock-offset
 # recovery, percentiles, loss/reorder accounting, and jitter's independence

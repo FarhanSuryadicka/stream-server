@@ -177,7 +177,7 @@ class PreviewPipeline:
         udp.settimeout(0.5)
         port = int(udp.getsockname()[1])
         process = None
-        if protocol in ("raw_udp", "rtp_udp"):
+        if protocol in ("raw_udp", "rtp_udp", "srt"):
             ffmpeg = self._find_ffmpeg()
             if not ffmpeg:
                 udp.close()
@@ -425,7 +425,7 @@ class DashboardState:
         duration = max(10, min(3600, int(request.get("duration", 60))))
         warmup = max(0, min(duration - 1, int(request.get("warmup", 5))))
         protocol = str(request.get("protocol", "raw_udp"))
-        if protocol not in ("raw_udp", "rtp_udp", "mjpeg"):
+        if protocol not in ("raw_udp", "rtp_udp", "srt", "mjpeg"):
             raise ValueError("protocol belum diimplementasikan")
 
         with self.lock:
@@ -606,7 +606,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         running_received += 1
         packet_received = int(frame.get("packets_received", 0))
         packet_lost = int(frame.get("packets_lost", 0))
-        if protocol in ("raw_udp", "rtp_udp", "mjpeg") and packet_received + packet_lost:
+        if protocol in ("raw_udp", "rtp_udp", "srt", "mjpeg") and packet_received + packet_lost:
             running_loss = 100.0 * packet_lost / (packet_received + packet_lost)
         else:
             running_loss = 100.0 * running_gaps / (running_received + running_gaps)
@@ -636,12 +636,17 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         "packets_received", frames[-1].get("packets_received", 0) if frames else 0))
     packets_lost = int(summary.get(
         "packets_lost", frames[-1].get("packets_lost", 0) if frames else 0))
+    packets_recovered = int(summary.get(
+        "packets_recovered", frames[-1].get("packets_recovered", 0) if frames else 0))
     if protocol == "raw_udp" and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "udp_packets"
     elif protocol == "rtp_udp" and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "rtp_packets"
+    elif protocol == "srt" and packets_received + packets_lost:
+        loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
+        loss_basis = "srt_detected_packets"
     elif protocol == "mjpeg" and packets_received + packets_lost:
         loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
         loss_basis = "tcp_retransmissions"
@@ -686,6 +691,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         "loss_basis": loss_basis,
         "packets_received": packets_received,
         "packets_lost": packets_lost,
+        "packets_recovered": packets_recovered,
         "packet_reorder": int(summary.get("packet_reorder_events", 0)),
         "packet_duplicates": int(summary.get("packet_duplicates", 0)),
         "reorder": int(summary.get("reorder_events", 0)),
