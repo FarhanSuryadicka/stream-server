@@ -53,6 +53,16 @@ UCV_MAGIC_ACK = 0x55435641
 UCV_CMD_GET_MODE = 0x09
 UCV_CMD_STOP_RUN = 0x07
 UCV_CTL_ACK_REQUESTED = 0x0001
+
+
+def unique_run_id(results_dir: Path, requested: str) -> str:
+    """Return a run ID whose NDJSON path does not already exist."""
+    run_id = requested
+    suffix = 2
+    while (results_dir / f"receiver-{run_id}.ndjson").exists():
+        run_id = f"{requested}-{suffix}"
+        suffix += 1
+    return run_id
 UCV_ACK_APPLIED = 0x0001
 
 
@@ -397,7 +407,7 @@ class DashboardState:
         phone = str(ipaddress.ip_address(str(request.get("phone", ""))))
         run_id = str(request.get("run_id", "")).strip()
         if not run_id:
-            run_id = f"{int(time.time())}-run"
+            run_id = f"{int(time.time() * 1000)}-run"
         # The Android harness currently generates "<epoch>-run". Accepting the
         # visible numeric portion is convenient, but the receiver must hash the
         # exact same string or every video packet is correctly rejected.
@@ -421,6 +431,13 @@ class DashboardState:
         with self.lock:
             if self.process and self.process.poll() is None:
                 raise ValueError("a receiver session is already running")
+
+            # Never truncate a previous measurement. The UI echoes the
+            # generated ID while a run is active, so without this guard a
+            # second Start reused that value and NdjsonWriter opened the same
+            # receiver-<id>.ndjson with "wb". Keep an explicitly supplied base
+            # readable and append a deterministic suffix on collision.
+            run_id = unique_run_id(self.results_dir, run_id)
 
             preview_port = self.preview.start(protocol)
             command = [
@@ -563,6 +580,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
     previous_seq: int | None = None
     running_gaps = 0
     running_received = 0
+    protocol = meta.get("protocol", "unknown")
 
     for index, frame in enumerate(frames):
         cap = int(frame["cap_ns"])
@@ -586,7 +604,12 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
                 running_gaps += delta - 1
         previous_seq = seq_value
         running_received += 1
-        running_loss = 100.0 * running_gaps / (running_received + running_gaps)
+        packet_received = int(frame.get("packets_received", 0))
+        packet_lost = int(frame.get("packets_lost", 0))
+        if protocol == "raw_udp" and packet_received + packet_lost:
+            running_loss = 100.0 * packet_lost / (packet_received + packet_lost)
+        else:
+            running_loss = 100.0 * running_gaps / (running_received + running_gaps)
         if include_series:
             series.append({
                 "i": index + 1, "seq": frame.get("seq", 0),
@@ -609,12 +632,22 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
     received = int(summary.get("frames_received", len(frames)))
     gaps = int(summary.get("gap_frames", running_gaps))
     total_expected = received + gaps
+    packets_received = int(summary.get(
+        "packets_received", frames[-1].get("packets_received", 0) if frames else 0))
+    packets_lost = int(summary.get(
+        "packets_lost", frames[-1].get("packets_lost", 0) if frames else 0))
+    if protocol == "raw_udp" and packets_received + packets_lost:
+        loss_pct = 100.0 * packets_lost / (packets_received + packets_lost)
+        loss_basis = "udp_packets"
+    else:
+        loss_pct = 100.0 * gaps / total_expected if total_expected else 0.0
+        loss_basis = "frames"
     clock_status = summary.get("clock_status", "RUNNING" if frames else "INCOMPLETE")
 
     result = {
         "file": relative,
         "run_id": meta.get("run_id", path.stem.removeprefix("receiver-")),
-        "protocol": meta.get("protocol", "unknown"),
+        "protocol": protocol,
         "mode": mode,
         "condition": condition,
         # Operator-chosen comparison bucket. Empty means "group by capture mode".
@@ -643,7 +676,12 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         },
         "jitter_ms": round(jitter_ns / 1e6, 3),
         "gaps": gaps,
-        "loss_pct": round(100.0 * gaps / total_expected, 4) if total_expected else 0.0,
+        "loss_pct": round(loss_pct, 4),
+        "loss_basis": loss_basis,
+        "packets_received": packets_received,
+        "packets_lost": packets_lost,
+        "packet_reorder": int(summary.get("packet_reorder_events", 0)),
+        "packet_duplicates": int(summary.get("packet_duplicates", 0)),
         "reorder": int(summary.get("reorder_events", 0)),
         "duplicates": int(summary.get("duplicates", 0)),
         "reassembly_failures": int(summary.get("reassembly_failures", 0)),

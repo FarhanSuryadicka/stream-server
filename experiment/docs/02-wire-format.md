@@ -13,7 +13,7 @@ Floats are IEEE-754 binary32/64, also LE.
 
 ## 1. Frame preamble (downstream: phone → PC)
 
-Fixed **48 bytes**, prepended to every encoded video frame. Used directly by
+Fixed **56 bytes** for Raw UDP frame fragments. Used directly by
 Raw UDP, SRT, and MJPEG-over-HTTP's binary variant; carried inside RTP header
 extensions or AMF metadata for the protocols that cannot take opaque bytes
 (see `01-harness-spec.md` §3.2).
@@ -22,21 +22,24 @@ extensions or AMF metadata for the protocols that cannot take opaque bytes
  offset  size  field            type      description
  ──────  ────  ───────────────  ────────  ─────────────────────────────────────
       0     4  magic            uint32    0x55435631 ("UCV1")
-      4     1  version          uint8     format version = 1
+      4     1  version          uint8     frame format version = 2
       5     1  flags            uint8     bit0 = keyframe
                                           bit1 = fragmented
                                           bit2 = last fragment
                                           bit3..7 reserved (must be 0)
       6     2  protocol_id      uint16    see §4
       8     4  frame_seq        uint32    monotonic, never reset within a run
-     12     4  payload_bytes    uint32    encoded frame size, excl. preamble
-     16     8  t_capture_ns     uint64    phone CLOCK_MONOTONIC
-     24     8  t_encoded_ns     uint64    phone CLOCK_MONOTONIC
-     32     8  t_sent_ns        uint64    phone CLOCK_MONOTONIC
-     40     4  run_id_hash      uint32    FNV-1a of the run_id string
-     44     4  header_crc32     uint32    CRC-32 of bytes [0..43]
+     12     4  packet_seq       uint32    monotonic for every UDP datagram
+     16     4  payload_bytes    uint32    encoded frame size, excl. preamble
+     20     2  fragment_index   uint16    zero-based index within frame
+     22     2  fragment_count   uint16    total datagrams for this frame
+     24     8  t_capture_ns     uint64    phone CLOCK_MONOTONIC
+     32     8  t_encoded_ns     uint64    phone CLOCK_MONOTONIC
+     40     8  t_sent_ns        uint64    phone CLOCK_MONOTONIC
+     48     4  run_id_hash      uint32    FNV-1a of the run_id string
+     52     4  header_crc32     uint32    CRC-32 of bytes [0..51]
  ──────  ────
-    48 bytes total
+    56 bytes total
 ```
 
 ### Field notes
@@ -65,19 +68,13 @@ UDP datagrams must stay under the path MTU to avoid IP-layer fragmentation,
 which turns one lost fragment into a lost frame with no visibility. A 720p
 H.264 keyframe at 4 Mbps routinely exceeds that.
 
-- **Fragment payload size: 1200 bytes.** Conservative: 1500 MTU − IP(20) −
-  UDP(8) − preamble(48) leaves 1424, and 1200 tolerates VPN/tunnel overhead.
-- Every fragment carries a **full 48-byte preamble** with identical
+- **Fragment payload size: 1200 bytes.** Conservative and leaves room for the
+  56-byte header plus VPN/tunnel overhead.
+- Every fragment carries a **full 56-byte preamble** with identical
   `frame_seq`, `t_*`, and `payload_bytes` (the size of the *whole* frame).
 - `flags` bit1 set on all fragments; bit2 set only on the last.
-- Fragment index is **implicit** — reassembly relies on arrival order within a
-  frame, and any gap invalidates the frame.
-
-> **Stated limitation:** implicit indexing means a reordered fragment is treated
-> as a lost frame. This is deliberate — it keeps the preamble at 48 bytes and
-> reordering within a single frame on a LAN is rare. It is recorded as
-> `reassembly_failures`, distinct from true loss, so the two are never conflated
-> in the results.
+- `packet_seq` exposes datagram gaps; `fragment_index/count` identifies every
+  fragment explicitly for loss and reorder diagnostics.
 
 ### 1.2 MJPEG/HTTP header variant
 

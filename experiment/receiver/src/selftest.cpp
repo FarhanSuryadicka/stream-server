@@ -42,19 +42,22 @@ static int g_failures = 0;
 
 static void TestWireSizes() {
   std::printf("\n[wire] struct sizes are a contract with the spec\n");
-  CHECK(sizeof(ucv_frame_header_t) == 48, "frame header is 48 bytes");
+  CHECK(sizeof(ucv_frame_header_t) == 56, "frame header is 56 bytes");
   CHECK(sizeof(ucv_control_t) == 32, "control message is 32 bytes");
   CHECK(sizeof(ucv_ack_t) == 40, "ack message is 40 bytes");
 
   // Field offsets must match the spec table exactly, or the Android sender
   // and this receiver will disagree about what a byte means.
   CHECK(offsetof(ucv_frame_header_t, frame_seq) == 8, "frame_seq at offset 8");
-  CHECK(offsetof(ucv_frame_header_t, payload_bytes) == 12, "payload_bytes at 12");
-  CHECK(offsetof(ucv_frame_header_t, t_capture_ns) == 16, "t_capture_ns at 16");
-  CHECK(offsetof(ucv_frame_header_t, t_encoded_ns) == 24, "t_encoded_ns at 24");
-  CHECK(offsetof(ucv_frame_header_t, t_sent_ns) == 32, "t_sent_ns at 32");
-  CHECK(offsetof(ucv_frame_header_t, run_id_hash) == 40, "run_id_hash at 40");
-  CHECK(offsetof(ucv_frame_header_t, header_crc32) == 44, "header_crc32 at 44");
+  CHECK(offsetof(ucv_frame_header_t, packet_seq) == 12, "packet_seq at 12");
+  CHECK(offsetof(ucv_frame_header_t, payload_bytes) == 16, "payload_bytes at 16");
+  CHECK(offsetof(ucv_frame_header_t, fragment_index) == 20, "fragment_index at 20");
+  CHECK(offsetof(ucv_frame_header_t, fragment_count) == 22, "fragment_count at 22");
+  CHECK(offsetof(ucv_frame_header_t, t_capture_ns) == 24, "t_capture_ns at 24");
+  CHECK(offsetof(ucv_frame_header_t, t_encoded_ns) == 32, "t_encoded_ns at 32");
+  CHECK(offsetof(ucv_frame_header_t, t_sent_ns) == 40, "t_sent_ns at 40");
+  CHECK(offsetof(ucv_frame_header_t, run_id_hash) == 48, "run_id_hash at 48");
+  CHECK(offsetof(ucv_frame_header_t, header_crc32) == 52, "header_crc32 at 52");
 }
 
 static void TestCrcRoundTrip() {

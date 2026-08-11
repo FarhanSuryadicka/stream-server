@@ -71,16 +71,20 @@ void NdjsonWriter::WriteMeta(const std::string& run_id,
 
 void NdjsonWriter::WriteFrame(uint32_t seq, uint64_t cap_ns, uint64_t enc_ns,
                               uint64_t snd_ns, uint64_t rcv_ns, uint32_t bytes,
-                              bool keyframe) {
+                              bool keyframe, uint64_t packets_received,
+                              uint64_t packets_lost) {
   if (!f_) return;
   std::fprintf(f_,
                "{\"type\":\"frame\",\"seq\":%u,\"cap_ns\":%llu,\"enc_ns\":%llu,"
-               "\"snd_ns\":%llu,\"rcv_ns\":%llu,\"bytes\":%u,\"key\":%s}\n",
+               "\"snd_ns\":%llu,\"rcv_ns\":%llu,\"bytes\":%u,\"key\":%s,"
+               "\"packets_received\":%llu,\"packets_lost\":%llu}\n",
                seq, static_cast<unsigned long long>(cap_ns),
                static_cast<unsigned long long>(enc_ns),
                static_cast<unsigned long long>(snd_ns),
                static_cast<unsigned long long>(rcv_ns), bytes,
-               keyframe ? "true" : "false");
+               keyframe ? "true" : "false",
+               static_cast<unsigned long long>(packets_received),
+               static_cast<unsigned long long>(packets_lost));
   // Keep the active-run dashboard within roughly half a second at 20 fps,
   // while avoiding an fflush syscall for every received packet/frame.
   if (++frames_since_flush_ >= 10) {
@@ -106,13 +110,18 @@ void NdjsonWriter::WriteSummary(uint64_t frames_received, uint64_t gap_frames,
                                 uint64_t reassembly_failures,
                                 uint64_t bytes_payload, uint64_t bytes_wire,
                                 int64_t offset_after_ns, int64_t drift_ns,
-                                bool clock_suspect) {
+                                bool clock_suspect, uint64_t packets_received,
+                                uint64_t packets_lost,
+                                uint64_t packet_reorder_events,
+                                uint64_t packet_duplicates) {
   if (!f_) return;
   std::fprintf(f_,
                "{\"type\":\"summary\",\"frames_received\":%llu,"
                "\"gap_frames\":%llu,\"reorder_events\":%llu,"
                "\"duplicates\":%llu,\"reassembly_failures\":%llu,"
                "\"bytes_payload\":%llu,\"bytes_wire\":%llu,"
+               "\"packets_received\":%llu,\"packets_lost\":%llu,"
+               "\"packet_reorder_events\":%llu,\"packet_duplicates\":%llu,"
                "\"clock_offset_after_ns\":%lld,\"clock_drift_ns\":%lld,"
                "\"clock_status\":\"%s\"}\n",
                static_cast<unsigned long long>(frames_received),
@@ -122,6 +131,10 @@ void NdjsonWriter::WriteSummary(uint64_t frames_received, uint64_t gap_frames,
                static_cast<unsigned long long>(reassembly_failures),
                static_cast<unsigned long long>(bytes_payload),
                static_cast<unsigned long long>(bytes_wire),
+               static_cast<unsigned long long>(packets_received),
+               static_cast<unsigned long long>(packets_lost),
+               static_cast<unsigned long long>(packet_reorder_events),
+               static_cast<unsigned long long>(packet_duplicates),
                static_cast<long long>(offset_after_ns),
                static_cast<long long>(drift_ns),
                clock_suspect ? "CLOCK_SUSPECT" : "OK");

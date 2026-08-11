@@ -74,6 +74,7 @@ typedef struct {
   int                sock;
   struct sockaddr_in peer;
   int                started;
+  uint32_t           packet_seq;
 } rawudp_impl_t;
 
 static int rawudp_start(ucv_transport_t *self, const char *cfg) {
@@ -121,6 +122,7 @@ static int rawudp_start(ucv_transport_t *self, const char *cfg) {
   }
 
   im->started = 1;
+  im->packet_seq = 0;
   TLOGI("rawudp: sending to %s:%d", host, port);
   return 0;
 }
@@ -137,6 +139,8 @@ static int rawudp_send(ucv_transport_t *self, const ucv_encoded_frame_t *f) {
   size_t offset    = 0;
   int    fragments = 0;
   int    failed    = 0;
+  const uint16_t fragment_count = (uint16_t)(
+      (f->size + UCV_UDP_FRAGMENT_PAYLOAD - 1) / UCV_UDP_FRAGMENT_PAYLOAD);
 
   do {
     size_t chunk = f->size - offset;
@@ -158,6 +162,9 @@ static int rawudp_send(ucv_transport_t *self, const ucv_encoded_frame_t *f) {
     /* payload_bytes is the WHOLE frame size in every fragment, so the
      * receiver can size its reassembly buffer from the first one. */
     ucv_fill_header(h, f, self->protocol_id, (uint32_t)f->size, flags);
+    h->packet_seq = im->packet_seq++;
+    h->fragment_index = (uint16_t)fragments;
+    h->fragment_count = fragment_count;
     memcpy(pkt + UCV_FRAME_HEADER_SIZE, f->data + offset, chunk);
 
     /* Stamped as late as possible — everything above is per-fragment work

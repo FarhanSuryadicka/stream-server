@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
   auto next = std::chrono::steady_clock::now();
 
   uint32_t seq = 0;
+  uint32_t packet_seq = 0;
   uint64_t sent_frames = 0, dropped_frames = 0;
   unsigned rng = 12345;
 
@@ -214,11 +215,18 @@ int main(int argc, char** argv) {
     rng = rng * 1103515245u + 12345u;
     if (drop_permil > 0 && static_cast<int>((rng >> 16) % 1000u) < drop_permil) {
       dropped_frames++;
+      packet_seq += static_cast<uint32_t>(
+          (payload.size() + UCV_UDP_FRAGMENT_PAYLOAD - 1) /
+          UCV_UDP_FRAGMENT_PAYLOAD);
       seq++;
       continue;
     }
 
     size_t offset = 0;
+    uint16_t fragment_index = 0;
+    const uint16_t fragment_count = static_cast<uint16_t>(
+        (payload.size() + UCV_UDP_FRAGMENT_PAYLOAD - 1) /
+        UCV_UDP_FRAGMENT_PAYLOAD);
     do {
       size_t chunk = payload.size() - offset;
       uint8_t flags = key ? UCV_FLAG_KEYFRAME : 0;
@@ -232,7 +240,10 @@ int main(int argc, char** argv) {
       h.protocol_id   = UCV_PROTO_RAWUDP;
       h.flags         = flags;
       h.frame_seq     = seq;
+      h.packet_seq    = packet_seq++;
       h.payload_bytes = static_cast<uint32_t>(payload.size());
+      h.fragment_index = fragment_index++;
+      h.fragment_count = fragment_count;
       h.t_capture_ns  = t_cap;
       h.t_encoded_ns  = t_enc;
       h.run_id_hash   = run_hash;

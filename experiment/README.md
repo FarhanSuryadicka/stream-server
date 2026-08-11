@@ -86,7 +86,7 @@ competing for isochronous USB bandwidth.
   MediaCodec (NDK, native C) → transport. Software encoders are rejected, not
   warned about.
 - Wire format shared by both sides — one header file, `static_assert`ed to
-  48/32/40 bytes so a padding change breaks the build instead of silently
+  56/32/40 bytes so a padding change breaks the build instead of silently
   corrupting measurements
 - Clock synchronisation (SNTP-style, 64 probes, lowest-RTT wins)
 - Android: Raw UDP transport, instrumented MJPEG transport, control channel,

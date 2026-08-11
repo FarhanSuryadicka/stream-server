@@ -23,10 +23,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -225,6 +227,46 @@ class Reassembler {
   std::vector<uint8_t> payload_;
 };
 
+// Packet-level accounting for Raw UDP. Unlike frame_seq, packet_seq advances
+// for every datagram, so loss of one fragment is visible even when the whole
+// video frame consequently cannot be decoded. Missing() is derived from the
+// unique set and therefore heals when a reordered packet arrives later.
+class PacketTracker {
+ public:
+  bool Observe(uint32_t packet_seq) {
+    if (!seen_.insert(packet_seq).second) {
+      duplicates_++;
+      return false;
+    }
+    if (!have_) {
+      have_ = true;
+      min_ = max_ = packet_seq;
+    } else {
+      if (packet_seq < max_) reorder_events_++;
+      if (packet_seq < min_) min_ = packet_seq;
+      if (packet_seq > max_) max_ = packet_seq;
+    }
+    return true;
+  }
+  uint64_t received() const { return seen_.size(); }
+  uint64_t missing() const {
+    if (!have_) return 0;
+    return static_cast<uint64_t>(max_ - min_) + 1 - seen_.size();
+  }
+  uint64_t reorder_events() const { return reorder_events_; }
+  uint64_t duplicates() const { return duplicates_; }
+  double loss_pct() const {
+    const uint64_t total = received() + missing();
+    return total ? 100.0 * static_cast<double>(missing()) / total : 0.0;
+  }
+
+ private:
+  bool have_ = false;
+  uint32_t min_ = 0, max_ = 0;
+  uint64_t reorder_events_ = 0, duplicates_ = 0;
+  std::unordered_set<uint32_t> seen_;
+};
+
 void SendPreviewFrame(ucv::UdpSender* sender, const Reassembler::Complete& frame,
                       bool jpeg) {
   if (!sender || frame.payload.empty()) return;
@@ -380,7 +422,14 @@ int main(int argc, char** argv) {
   // ------------------------------------------------------------------
   // 2. Open the video receiver
   // ------------------------------------------------------------------
-  ucv::NdjsonWriter log(opt.out_dir + "/receiver-" + opt.run_id + ".ndjson");
+  const std::string log_path = opt.out_dir + "/receiver-" + opt.run_id + ".ndjson";
+  if (std::filesystem::exists(log_path)) {
+    std::fprintf(stderr,
+                 "fatal: refusing to overwrite existing run log '%s'; use a new --run-id\n",
+                 log_path.c_str());
+    return 1;
+  }
+  ucv::NdjsonWriter log(log_path);
   if (!log.ok()) {
     std::fprintf(stderr, "fatal: cannot write log in '%s'\n", opt.out_dir.c_str());
     return 1;
@@ -491,6 +540,7 @@ int main(int argc, char** argv) {
   // 4. Receive loop
   // ------------------------------------------------------------------
   ucv::SequenceTracker seq;
+  PacketTracker        packets;
   ucv::JitterEstimator jitter;
   ucv::Distribution    transport_ms, glass_ms, encode_ms;
   Reassembler          reasm;
@@ -538,7 +588,7 @@ int main(int argc, char** argv) {
       bytes_payload += f.bytes;
       frames_in_window++;
       log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
-                     f.t_recv_ns, f.bytes, true);
+                     f.t_recv_ns, f.bytes, true, 0, 0);
       const auto now = std::chrono::steady_clock::now();
       if (now - last_report >= std::chrono::seconds(5)) {
         std::printf("[recv] %6llu MJPEG frames  transport p50=%.1f ms  jitter=%.2f ms  gaps=%llu\n",
@@ -563,6 +613,13 @@ int main(int argc, char** argv) {
     // A stale sender from a previous run would otherwise silently pollute
     // this run's statistics.
     if (h.run_id_hash != expected_run_hash) { wrong_run++; continue; }
+
+    if (!h.fragment_count || h.fragment_index >= h.fragment_count) {
+      bad_header++;
+      continue;
+    }
+    if (std::chrono::steady_clock::now() >= t_warmup)
+      packets.Observe(h.packet_seq);
 
     bytes_wire += static_cast<uint64_t>(n);
 
@@ -601,14 +658,15 @@ int main(int argc, char** argv) {
     frames_in_window++;
 
     log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
-                   f.t_recv_ns, f.bytes, f.keyframe);
+                   f.t_recv_ns, f.bytes, f.keyframe,
+                   packets.received(), packets.missing());
 
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report >= std::chrono::seconds(5)) {
-      std::printf("[recv] %6llu frames  transport p50=%.1f ms  jitter=%.2f ms  gaps=%llu\n",
+      std::printf("[recv] %6llu frames  transport p50=%.1f ms  jitter=%.2f ms  packet_loss=%.3f%%\n",
                   static_cast<unsigned long long>(frames_in_window),
                   transport_ms.Percentile(0.50), jitter.jitter_ms(),
-                  static_cast<unsigned long long>(seq.gap_frames()));
+                  packets.loss_pct());
       last_report = now;
     }
   }
@@ -674,6 +732,18 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(bad_header),
               static_cast<unsigned long long>(wrong_run));
 
+  if (opt.protocol == "raw_udp") {
+    std::printf("  UDP packets recv   %llu\n"
+                "  UDP packets lost   %llu (%.3f %%)\n"
+                "  packet reorder     %llu\n"
+                "  packet duplicates  %llu\n",
+                static_cast<unsigned long long>(packets.received()),
+                static_cast<unsigned long long>(packets.missing()),
+                packets.loss_pct(),
+                static_cast<unsigned long long>(packets.reorder_events()),
+                static_cast<unsigned long long>(packets.duplicates()));
+  }
+
   std::printf("\nJitter (RFC 3550)        [clock-offset independent]\n"
               "  %.3f ms\n", jitter.jitter_ms());
 
@@ -731,7 +801,9 @@ int main(int argc, char** argv) {
   log.WriteSummary(seq.received(), seq.gap_frames(), seq.reorder_events(),
                    seq.duplicates(), reasm.failures(), bytes_payload, bytes_wire,
                    have_after ? sync_after.offset_ns : 0, drift_ns,
-                   clock_suspect || !have_after);
+                   clock_suspect || !have_after,
+                   packets.received(), packets.missing(),
+                   packets.reorder_events(), packets.duplicates());
   log.Close();
 
   std::printf("\nlog written: %s/receiver-%s.ndjson\n",

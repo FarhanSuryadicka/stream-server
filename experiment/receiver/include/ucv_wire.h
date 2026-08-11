@@ -24,6 +24,7 @@ extern "C" {
 #define UCV_MAGIC_ACK     0x55435641u /* "UCVA" */
 
 #define UCV_WIRE_VERSION 1
+#define UCV_FRAME_VERSION 2
 
 /* Frame preamble flags */
 #define UCV_FLAG_KEYFRAME      0x01
@@ -36,7 +37,7 @@ extern "C" {
 #define UCV_ACK_APPLIED 0x0001
 
 /* Sizes are contractual — asserted at compile time below. */
-#define UCV_FRAME_HEADER_SIZE   48
+#define UCV_FRAME_HEADER_SIZE   56
 #define UCV_CONTROL_SIZE        32
 #define UCV_ACK_SIZE            40
 
@@ -99,12 +100,15 @@ typedef struct {
   uint8_t  flags;          /* UCV_FLAG_*                            */
   uint16_t protocol_id;    /* ucv_protocol_t                        */
   uint32_t frame_seq;      /* monotonic, never reset within a run   */
+  uint32_t packet_seq;     /* monotonic for every UDP datagram      */
   uint32_t payload_bytes;  /* whole-frame size, excl. this header   */
+  uint16_t fragment_index; /* zero based within frame               */
+  uint16_t fragment_count; /* one for an unfragmented frame         */
   uint64_t t_capture_ns;   /* phone CLOCK_MONOTONIC                 */
   uint64_t t_encoded_ns;   /* phone CLOCK_MONOTONIC                 */
   uint64_t t_sent_ns;      /* phone CLOCK_MONOTONIC, stamped last   */
   uint32_t run_id_hash;    /* FNV-1a of run_id                      */
-  uint32_t header_crc32;   /* CRC-32 over bytes [0..43]             */
+  uint32_t header_crc32;   /* CRC-32 over all preceding bytes       */
 } ucv_frame_header_t;
 
 typedef struct {
@@ -145,7 +149,7 @@ typedef struct {
  * fail the build instead. */
 #ifdef __cplusplus
 static_assert(sizeof(ucv_frame_header_t) == UCV_FRAME_HEADER_SIZE,
-              "frame header must be exactly 48 bytes");
+              "frame header must be exactly 56 bytes");
 static_assert(sizeof(ucv_control_t) == UCV_CONTROL_SIZE,
               "control message must be exactly 32 bytes");
 static_assert(sizeof(ucv_ack_t) == UCV_ACK_SIZE,
@@ -154,7 +158,7 @@ static_assert(sizeof(ucv_start_run_payload_t) == 8,
               "start payload must be exactly 8 bytes");
 #else
 _Static_assert(sizeof(ucv_frame_header_t) == UCV_FRAME_HEADER_SIZE,
-               "frame header must be exactly 48 bytes");
+               "frame header must be exactly 56 bytes");
 _Static_assert(sizeof(ucv_control_t) == UCV_CONTROL_SIZE,
                "control message must be exactly 32 bytes");
 _Static_assert(sizeof(ucv_ack_t) == UCV_ACK_SIZE,
@@ -198,7 +202,7 @@ static inline uint32_t ucv_run_id_hash(const char *s) {
 
 static inline void ucv_frame_header_finalize(ucv_frame_header_t *h) {
   h->magic   = UCV_MAGIC_FRAME;
-  h->version = UCV_WIRE_VERSION;
+  h->version = UCV_FRAME_VERSION;
   h->header_crc32 = ucv_crc32(h, UCV_FRAME_HEADER_SIZE - 4);
 }
 
@@ -207,7 +211,7 @@ static inline void ucv_frame_header_finalize(ucv_frame_header_t *h) {
  * a discarded frame does. */
 static inline int ucv_frame_header_valid(const ucv_frame_header_t *h) {
   if (h->magic != UCV_MAGIC_FRAME) return 0;
-  if (h->version != UCV_WIRE_VERSION) return 0;
+  if (h->version != UCV_FRAME_VERSION) return 0;
   return h->header_crc32 == ucv_crc32(h, UCV_FRAME_HEADER_SIZE - 4);
 }
 

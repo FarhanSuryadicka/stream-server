@@ -95,13 +95,13 @@
       <div class="card"><span>Transport p95</span><strong id="p95">—</strong><small> ms</small></div>
       <div class="card"><span>Transport p99</span><strong id="p99">—</strong><small> ms</small></div>
       <div class="card"><span>Jitter</span><strong id="jitter">—</strong><small> ms</small></div>
-      <div class="card"><span>Observed loss</span><strong id="loss">—</strong><small> %</small></div>
+      <div class="card"><span id="lossLabel">Observed loss</span><strong id="loss">—</strong><small> %</small></div>
       <div class="card"><span>Goodput</span><strong id="goodput">—</strong><small> Mbps</small></div>
     </div>
     <div class="metric-charts">
       <div class="chart-box"><h3>Network latency (ms)</h3><canvas id="latencyChart"></canvas></div>
       <div class="chart-box"><h3>Running jitter (ms)</h3><canvas id="jitterChart"></canvas></div>
-      <div class="chart-box"><h3>Observed packet loss (%)</h3><canvas id="lossChart"></canvas></div>
+      <div class="chart-box"><h3 id="lossChartTitle">Observed loss (%)</h3><canvas id="lossChart"></canvas></div>
     </div>
     <div class="label-editor">
       <label>Comparison group<input id="labelGroup" placeholder="tulis nama grup, mis. 720p uji ulang"></label>
@@ -145,6 +145,7 @@
     $('validity').textContent=selectedRun.valid?'VALID RUN':selectedRun.clock_status;$('validity').className=selectedRun.valid?'ok':'bad';
     $('p50').textContent=f(selectedRun.transport.p50);$('p95').textContent=f(selectedRun.transport.p95);$('p99').textContent=f(selectedRun.transport.p99);
     $('jitter').textContent=f(selectedRun.jitter_ms);$('loss').textContent=f(selectedRun.loss_pct,3);$('goodput').textContent=f(selectedRun.goodput_mbps);
+    const packetLoss=selectedRun.loss_basis==='udp_packets';$('lossLabel').textContent=packetLoss?'Observed UDP packet loss':'Observed frame loss';$('lossChartTitle').textContent=packetLoss?'Observed UDP packet loss (%)':'Observed frame loss (%)';
     // Show the group that belongs to THIS run. Keeping the previous run's text
     // in the field meant a Save label after switching runs (e.g. a new capture
     // mode) silently moved the label off the run it was written for, and the
@@ -217,7 +218,7 @@
     // A finished run must stay on screen: keep reading its file so the charts
     // show the completed measurement instead of a stale "waiting" placeholder.
     if(!live){pollSession.lastActive=null;if(s.run_id)selectedFile??=`receiver-${s.run_id}.ndjson`}
-    if(s.state==='complete'&&pollSession.last!==s.exit_code+':'+s.run_id){pollSession.last=s.exit_code+':'+s.run_id;refreshRuns()}}catch(e){$('console').textContent=e.message}}
+    if(['complete','failed'].includes(s.state)&&pollSession.last!==s.exit_code+':'+s.run_id){pollSession.last=s.exit_code+':'+s.run_id;if($('runId').value===s.run_id)$('runId').value='';refreshRuns()}}catch(e){$('console').textContent=e.message}}
   $('startBtn').onclick=async()=>{try{const s=await post('/api/start',{phone:$('phone').value,protocol:$('protocol').value,run_id:$('runId').value,mode:$('mode').value,condition:'clean',duration:+$('duration').value,warmup:+$('warmup').value});$('runId').value=s.run_id;selectedFile=`receiver-${s.run_id}.ndjson`;pollSession()}catch(e){alert(e.message)}};
   function updateExactMode(){const item=cameraResolutions[+$('resolution').value],fps=item?.fps?.[0];$('mode').value=item&&fps?`${item.width}x${item.height}@${fps}`:'';if(item&&fps)$('modesState').textContent=`Selected: ${item.width} x ${item.height} - FPS auto (${fps}, tertinggi yang didukung kamera).`}
   async function refreshModes(showError=true){const b=$('modesBtn');b.disabled=true;$('modesState').textContent='Membaca descriptor MJPEG dari kamera HP...';try{const data=await api('/api/modes?phone='+encodeURIComponent($('phone').value));cameraResolutions=data.resolutions;const preferredResolution=data.recommended.split('@')[0];$('resolution').innerHTML=cameraResolutions.map((m,i)=>`<option value="${i}" ${`${m.width}x${m.height}`===preferredResolution?'selected':''}>${m.width} x ${m.height}</option>`).join('');updateExactMode();}catch(e){cameraResolutions=[];$('resolution').innerHTML='<option value="">Camera agent unavailable</option>';$('mode').value='';$('modesState').textContent=e.message;if(showError)alert(e.message)}finally{b.disabled=false}}

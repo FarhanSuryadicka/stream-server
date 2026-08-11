@@ -315,9 +315,13 @@ Duration : 60 seconds
 Warmup   : 5 seconds
 ```
 
-Run ID boleh dikosongkan. Dashboard akan membuat `<epoch>-run` otomatis dan
-mengirim hash yang sama ke HP. Ini mencegah masalah `wrong-run frames` akibat
-run ID yang berbeda.
+Run ID boleh dikosongkan. Dashboard akan membuat `<epoch-milidetik>-run`
+otomatis dan mengirim hash yang sama ke HP. Setelah run selesai, field akan
+dikosongkan agar Start berikutnya mendapat ID baru. Jika ID lama dimasukkan
+lagi, dashboard menambahkan suffix `-2`, `-3`, dan seterusnya; file hasil lama
+tidak pernah ditimpa. Receiver CLI juga menolak menimpa file dengan Run ID yang
+sudah ada. Ini sekaligus mencegah masalah `wrong-run frames` akibat run ID yang
+berbeda.
 
 `Condition` tidak lagi muncul pada form. Run baru otomatis disimpan sebagai
 `condition=clean`. Field tetap ada di NDJSON untuk kompatibilitas log lama.
@@ -421,13 +425,15 @@ RFC 3550. Jitter tidak bergantung pada offset clock absolut.
 
 ### Observed packet loss
 
-Dihitung dari gap sequence frame yang benar-benar terlihat receiver:
+Dihitung dari `packet_seq` unik pada setiap datagram Raw UDP:
 
 ```text
-loss % = missing sequence / expected sequence * 100
+loss % = missing UDP packets / expected UDP packets * 100
 ```
 
-Ini adalah observed application/frame loss, bukan packet capture seluruh wire.
+Nilai diperbarui realtime dan mendeteksi satu fragmen yang hilang walaupun
+frame videonya tidak selesai. Untuk MJPEG/TCP, dashboard menampilkan observed
+frame loss karena retransmisi TCP tidak terlihat di level aplikasi.
 
 ### Statistik lain yang tetap dicatat
 
