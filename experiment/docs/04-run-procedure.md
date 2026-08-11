@@ -14,7 +14,8 @@ operator follows at the rig.
 ```
 
 Configures CMake, builds `ucv-receiver` / `ucv-selftest` / `ucv-mocksender` /
-`ucv-nv12test` into `experiment\receiver\build\`, runs the test suite, and
+`ucv-nv12test` / `ucv-jpegtest` into `experiment\receiver\build\`, runs the
+test suite, and
 prints the IP to enter on the phone. Add `-Clean` for a from-scratch rebuild.
 
 The script passes the compiler explicitly because this machine has MinGW-w64

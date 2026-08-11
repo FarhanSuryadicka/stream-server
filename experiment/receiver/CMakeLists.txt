@@ -34,6 +34,57 @@ set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${UCV_CPP_DIR}/libdatachannel ${CMAKE_BINARY_DIR}/ldc EXCLUDE_FROM_ALL)
 
+# Build the same vendored libjpeg-turbo sources on the host so the Android
+# decoder can be smoke-tested without a phone. The upstream project registers
+# its full test/install suite unconditionally, so list its baseline sources as
+# the Android build already does. SIMD is intentionally off: this checks
+# lifecycle, recovery and output, not host JPEG performance.
+set(UCV_JPEG_DIR ${UCV_CPP_DIR}/libjpeg-turbo)
+set(UCV_JPEG_GEN_DIR ${CMAKE_BINARY_DIR}/jpeg-config)
+set(JPEG_LIB_VERSION 62)
+set(VERSION "2.1.5")
+set(LIBJPEG_TURBO_VERSION_NUMBER 2001005)
+set(BITS_IN_JSAMPLE 8)
+set(MEM_SRCDST_SUPPORTED 1)
+set(BUILD "host-smoke")
+set(INLINE "inline")
+set(THREAD_LOCAL "__thread")
+set(SIZE_T ${CMAKE_SIZEOF_VOID_P})
+set(COPYRIGHT_YEAR "2023")
+configure_file(${UCV_JPEG_DIR}/jconfig.h.in ${UCV_JPEG_GEN_DIR}/jconfig.h @ONLY)
+configure_file(${UCV_JPEG_DIR}/jconfigint.h.in ${UCV_JPEG_GEN_DIR}/jconfigint.h @ONLY)
+configure_file(${UCV_JPEG_DIR}/jversion.h.in ${UCV_JPEG_GEN_DIR}/jversion.h @ONLY)
+
+add_library(ucv-jpeg-host STATIC
+    ${UCV_JPEG_DIR}/jcapimin.c ${UCV_JPEG_DIR}/jcapistd.c
+    ${UCV_JPEG_DIR}/jccoefct.c ${UCV_JPEG_DIR}/jccolor.c
+    ${UCV_JPEG_DIR}/jcdctmgr.c ${UCV_JPEG_DIR}/jchuff.c
+    ${UCV_JPEG_DIR}/jcicc.c ${UCV_JPEG_DIR}/jcinit.c
+    ${UCV_JPEG_DIR}/jcmainct.c ${UCV_JPEG_DIR}/jcmarker.c
+    ${UCV_JPEG_DIR}/jcmaster.c ${UCV_JPEG_DIR}/jcomapi.c
+    ${UCV_JPEG_DIR}/jcparam.c ${UCV_JPEG_DIR}/jcphuff.c
+    ${UCV_JPEG_DIR}/jcprepct.c ${UCV_JPEG_DIR}/jcsample.c
+    ${UCV_JPEG_DIR}/jctrans.c ${UCV_JPEG_DIR}/jdapimin.c
+    ${UCV_JPEG_DIR}/jdapistd.c ${UCV_JPEG_DIR}/jdatadst.c
+    ${UCV_JPEG_DIR}/jdatasrc.c ${UCV_JPEG_DIR}/jdcoefct.c
+    ${UCV_JPEG_DIR}/jdcolor.c ${UCV_JPEG_DIR}/jddctmgr.c
+    ${UCV_JPEG_DIR}/jdhuff.c ${UCV_JPEG_DIR}/jdicc.c
+    ${UCV_JPEG_DIR}/jdinput.c ${UCV_JPEG_DIR}/jdmainct.c
+    ${UCV_JPEG_DIR}/jdmarker.c ${UCV_JPEG_DIR}/jdmaster.c
+    ${UCV_JPEG_DIR}/jdmerge.c ${UCV_JPEG_DIR}/jdphuff.c
+    ${UCV_JPEG_DIR}/jdpostct.c ${UCV_JPEG_DIR}/jdsample.c
+    ${UCV_JPEG_DIR}/jdtrans.c ${UCV_JPEG_DIR}/jerror.c
+    ${UCV_JPEG_DIR}/jfdctflt.c ${UCV_JPEG_DIR}/jfdctfst.c
+    ${UCV_JPEG_DIR}/jfdctint.c ${UCV_JPEG_DIR}/jidctflt.c
+    ${UCV_JPEG_DIR}/jidctfst.c ${UCV_JPEG_DIR}/jidctint.c
+    ${UCV_JPEG_DIR}/jidctred.c ${UCV_JPEG_DIR}/jquant1.c
+    ${UCV_JPEG_DIR}/jquant2.c ${UCV_JPEG_DIR}/jutils.c
+    ${UCV_JPEG_DIR}/jmemmgr.c ${UCV_JPEG_DIR}/jmemnobs.c
+    ${UCV_JPEG_DIR}/jsimd_none.c
+)
+target_include_directories(ucv-jpeg-host PUBLIC
+    ${UCV_JPEG_DIR} ${UCV_JPEG_GEN_DIR})
+
 if(NOT CMAKE_BUILD_TYPE)
   # Measurement code compiled -O0 would add its own latency to the numbers it
   # reports, so Release is the default rather than an opt-in.
@@ -84,8 +135,21 @@ target_link_libraries(ucv-webrtc-mocksender PRIVATE datachannel-static)
 # protocol under test. Cheaper to catch here than on the rig.
 add_executable(ucv-nv12test src/nv12test.cpp)
 
+# Compiles the Android decoder source itself with only the MediaCodec half
+# disabled. The valid -> corrupt -> valid sequence catches regressions where a
+# libjpeg longjmp leaves the persistent decoder unusable for the next frame.
+add_executable(ucv-jpegtest
+    src/jpegtest.cpp
+    ${UCV_CPP_DIR}/ucv_encoder.c
+)
+target_compile_definitions(ucv-jpegtest PRIVATE UCV_JPEG_ONLY)
+target_include_directories(ucv-jpegtest PRIVATE
+    ${UCV_CPP_DIR}
+)
+target_link_libraries(ucv-jpegtest PRIVATE ucv-jpeg-host)
+
 set(UCV_TARGETS ucv-receiver ucv-selftest ucv-mocksender ucv-nv12test
-    ucv-webrtc-mocksender)
+    ucv-jpegtest ucv-webrtc-mocksender)
 
 foreach(t IN LISTS UCV_TARGETS)
   target_include_directories(${t} PRIVATE include)
@@ -114,3 +178,4 @@ endforeach()
 enable_testing()
 add_test(NAME primitives COMMAND ucv-selftest)
 add_test(NAME nv12 COMMAND ucv-nv12test)
+add_test(NAME jpeg_reuse COMMAND ucv-jpegtest)

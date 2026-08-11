@@ -6,17 +6,22 @@
 
 #include "ucv_encoder.h"
 
+#ifndef UCV_JPEG_ONLY
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <android/api-level.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#endif
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <jpeglib.h>
 #include <setjmp.h>
+
+#ifndef UCV_JPEG_ONLY
 
 #define TAG "ucv-encoder"
 #define ELOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -351,6 +356,18 @@ int ucv_encoder_drain(ucv_encoder_t *e, const uint8_t **out_data,
 uint64_t ucv_encoder_frames_in(const ucv_encoder_t *e)  { return e ? e->frames_in : 0; }
 uint64_t ucv_encoder_frames_out(const ucv_encoder_t *e) { return e ? e->frames_out : 0; }
 uint64_t ucv_encoder_drops(const ucv_encoder_t *e)      { return e ? e->drops : 0; }
+
+#else
+
+/* Host smoke tests compile this file with UCV_JPEG_ONLY. Keep the decoder
+ * implementation identical to Android while replacing only its log sink. */
+#define ELOGE_BOTH(...)            \
+  do {                             \
+    fprintf(stderr, __VA_ARGS__);  \
+    fputc('\n', stderr);           \
+  } while (0)
+
+#endif
 
 /* ================================================================ */
 /* MJPEG -> NV12                                                     */

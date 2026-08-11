@@ -94,7 +94,8 @@ competing for isochronous USB bandwidth.
 - PC: `ucv-receiver` — Raw UDP/RTP/SRT receive and reassembly, packet loss,
   MJPEG/TCP retransmission-rate, jitter accounting, control-RTT-under-load,
   NDJSON logging
-- `ucv-selftest` (34 checks) and `ucv-nv12test` — both passing
+- `ucv-selftest`, `ucv-nv12test`, and `ucv-jpegtest` — measurement,
+  NV12-layout, and persistent-decoder recovery checks
 - `ucv-mocksender` — phone stand-in; the whole path was validated end-to-end
   on one machine, including synthetic loss the receiver correctly reported
 - `analysis/analyze.py` — turns logs into the comparison table
