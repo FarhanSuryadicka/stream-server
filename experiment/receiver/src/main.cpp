@@ -59,7 +59,7 @@ void PrintUsage(const char* argv0) {
       "Usage: %s --phone <ip> [options]\n"
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
-      "  --protocol <name>     raw_udp | mjpeg  (default: raw_udp)\n"
+      "  --protocol <name>     raw_udp | rtp_udp | mjpeg  (default: raw_udp)\n"
       "  --video-port <n>      Video port      (default: protocol default)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
@@ -116,6 +116,8 @@ bool ParseArgs(int argc, char** argv, Options* o) {
   if (o->run_id.empty()) o->run_id = ucv::MakeRunId(o->protocol);
   if (o->protocol == "mjpeg" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_MJPEG;
+  if (o->protocol == "rtp_udp" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_RTP;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -228,6 +230,132 @@ class Reassembler {
   uint64_t accumulated_ = 0;
   uint64_t failures_    = 0;
   std::vector<uint8_t> payload_;
+};
+
+// RFC 6184 RTP/H.264 reassembly. Measurement metadata is carried in an
+// RFC 8285 two-byte extension (profile 0x1000, element id 1). Fragments are
+// stored by explicit index so ordinary UDP reordering does not corrupt video.
+class RtpReassembler {
+ public:
+  int Push(const uint8_t* packet, size_t packet_bytes, uint64_t t_recv_ns,
+           uint32_t expected_run_hash, ucv_frame_header_t* header,
+           Reassembler::Complete* out) {
+    if (packet_bytes < 12 || (packet[0] >> 6) != 2 || !(packet[0] & 0x10))
+      return -1;
+    const size_t csrc_bytes = static_cast<size_t>(packet[0] & 0x0f) * 4;
+    size_t pos = 12 + csrc_bytes;
+    if (pos + 4 > packet_bytes) return -1;
+    const uint16_t profile = ReadBe16(packet + pos);
+    const size_t ext_bytes = static_cast<size_t>(ReadBe16(packet + pos + 2)) * 4;
+    pos += 4;
+    if (profile != 0x1000 || pos + ext_bytes > packet_bytes) return -1;
+
+    bool found = false;
+    size_t ext = pos, ext_end = pos + ext_bytes;
+    while (ext + 2 <= ext_end) {
+      const uint8_t id = packet[ext++];
+      const uint8_t len = packet[ext++];
+      if (id == 0) continue;
+      if (ext + len > ext_end) return -1;
+      if (id == 1 && len == UCV_FRAME_HEADER_SIZE) {
+        std::memcpy(header, packet + ext, sizeof(*header));
+        found = true;
+        break;
+      }
+      ext += len;
+    }
+    pos = ext_end;
+    if (!found || !ucv_frame_header_valid(header) ||
+        header->protocol_id != UCV_PROTO_RTSP ||
+        !header->fragment_count ||
+        header->fragment_count > 4096 ||
+        header->fragment_index >= header->fragment_count || pos >= packet_bytes)
+      return -1;
+    if (header->run_id_hash != expected_run_hash) return -2;
+
+    if (open_ && open_seq_ != header->frame_seq) {
+      failures_++;
+      Reset();
+    }
+    if (!open_) {
+      open_ = true;
+      open_seq_ = header->frame_seq;
+      expected_ = header->fragment_count;
+      chunks_.assign(expected_, {});
+      present_.assign(expected_, false);
+      received_ = 0;
+      first_ = *header;
+      last_sent_ns_ = header->t_sent_ns;
+    }
+    if (expected_ != header->fragment_count) {
+      failures_++;
+      Reset();
+      return -1;
+    }
+
+    const uint8_t* payload = packet + pos;
+    const size_t payload_bytes = packet_bytes - pos;
+    std::vector<uint8_t> decoded;
+    const uint8_t nal_type = payload[0] & 0x1f;
+    if (nal_type >= 1 && nal_type <= 23) {
+      static const uint8_t start_code[] = {0, 0, 0, 1};
+      decoded.insert(decoded.end(), start_code, start_code + 4);
+      decoded.insert(decoded.end(), payload, payload + payload_bytes);
+    } else if (nal_type == 28 && payload_bytes >= 3) {
+      const uint8_t fu = payload[1];
+      if (fu & 0x80) {
+        static const uint8_t start_code[] = {0, 0, 0, 1};
+        decoded.insert(decoded.end(), start_code, start_code + 4);
+        decoded.push_back(static_cast<uint8_t>((payload[0] & 0xe0) | (fu & 0x1f)));
+      }
+      decoded.insert(decoded.end(), payload + 2, payload + payload_bytes);
+    } else {
+      failures_++;
+      Reset();
+      return -1;
+    }
+
+    const uint16_t index = header->fragment_index;
+    if (!present_[index]) {
+      chunks_[index] = std::move(decoded);
+      present_[index] = true;
+      received_++;
+    }
+    if (index + 1 == expected_) last_sent_ns_ = header->t_sent_ns;
+    if (received_ != expected_) return 0;
+
+    out->seq = first_.frame_seq;
+    out->t_capture_ns = first_.t_capture_ns;
+    out->t_encoded_ns = first_.t_encoded_ns;
+    out->t_sent_ns = last_sent_ns_;
+    out->t_recv_ns = t_recv_ns;
+    out->bytes = first_.payload_bytes;
+    out->keyframe = (first_.flags & UCV_FLAG_KEYFRAME) != 0;
+    out->run_hash = first_.run_id_hash;
+    out->payload.clear();
+    for (auto& chunk : chunks_)
+      out->payload.insert(out->payload.end(), chunk.begin(), chunk.end());
+    Reset();
+    return 1;
+  }
+
+  uint64_t failures() const { return failures_; }
+
+ private:
+  static uint16_t ReadBe16(const uint8_t* p) {
+    return static_cast<uint16_t>((p[0] << 8) | p[1]);
+  }
+  void Reset() {
+    open_ = false; expected_ = received_ = 0;
+    chunks_.clear(); present_.clear();
+  }
+  bool open_ = false;
+  uint32_t open_seq_ = 0;
+  uint16_t expected_ = 0, received_ = 0;
+  uint64_t last_sent_ns_ = 0, failures_ = 0;
+  ucv_frame_header_t first_{};
+  std::vector<std::vector<uint8_t>> chunks_;
+  std::vector<bool> present_;
 };
 
 // Packet-level accounting for Raw UDP. Unlike frame_seq, packet_seq advances
@@ -453,7 +581,7 @@ int main(int argc, char** argv) {
   ucv::UdpSocket video;
   ucv::UdpSender preview;
   MjpegReader mjpeg;
-  if (opt.protocol == "raw_udp") {
+  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp") {
     if (!video.Bind(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot bind UDP :%d\n", opt.video_port);
       return 1;
@@ -492,8 +620,8 @@ int main(int argc, char** argv) {
                    "fatal: remote phone control needs --mode WxH@fps\n");
       return 2;
     }
-    const uint8_t protocol_id = opt.protocol == "mjpeg"
-        ? UCV_PROTO_MJPEG : UCV_PROTO_RAWUDP;
+    const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
+        (opt.protocol == "rtp_udp" ? UCV_PROTO_RTSP : UCV_PROTO_RAWUDP);
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
                                 protocol_id, opt.video_port)) {
@@ -556,6 +684,7 @@ int main(int argc, char** argv) {
   ucv::JitterEstimator jitter;
   ucv::Distribution    transport_ms, glass_ms, encode_ms;
   Reassembler          reasm;
+  RtpReassembler       rtp_reasm;
 
   uint64_t bytes_payload = 0, bytes_wire = 0;
   uint64_t bad_header = 0, wrong_run = 0;
@@ -633,11 +762,22 @@ int main(int argc, char** argv) {
     if (n <= 0) continue;
 
     const uint64_t t_recv = ucv::NowNs();
-    if (n < static_cast<int>(UCV_FRAME_HEADER_SIZE)) { bad_header++; continue; }
-
     ucv_frame_header_t h;
-    std::memcpy(&h, buf.data(), sizeof(h));
-    if (!ucv_frame_header_valid(&h)) { bad_header++; continue; }
+    Reassembler::Complete f;
+    int assembled = 0;
+    if (opt.protocol == "rtp_udp") {
+      assembled = rtp_reasm.Push(buf.data(), static_cast<size_t>(n), t_recv,
+                                 expected_run_hash, &h, &f);
+      if (assembled == -2) { wrong_run++; continue; }
+      if (assembled < 0) { bad_header++; continue; }
+    } else {
+      if (n < static_cast<int>(UCV_FRAME_HEADER_SIZE)) {
+        bad_header++; continue;
+      }
+      std::memcpy(&h, buf.data(), sizeof(h));
+      if (!ucv_frame_header_valid(&h) ||
+          h.protocol_id != UCV_PROTO_RAWUDP) { bad_header++; continue; }
+    }
 
     // A stale sender from a previous run would otherwise silently pollute
     // this run's statistics.
@@ -652,11 +792,14 @@ int main(int argc, char** argv) {
 
     bytes_wire += static_cast<uint64_t>(n);
 
-    Reassembler::Complete f;
-    const uint8_t* chunk = buf.data() + UCV_FRAME_HEADER_SIZE;
-    if (!reasm.Push(h, chunk,
-                    static_cast<size_t>(n) - UCV_FRAME_HEADER_SIZE, t_recv, &f))
-      continue;
+    if (opt.protocol == "rtp_udp") {
+      if (!assembled) continue;
+    } else {
+      const uint8_t* chunk = buf.data() + UCV_FRAME_HEADER_SIZE;
+      if (!reasm.Push(h, chunk,
+                      static_cast<size_t>(n) - UCV_FRAME_HEADER_SIZE,
+                      t_recv, &f)) continue;
+    }
 
     // Preview sees the initial SPS/PPS-bearing keyframe even though warmup
     // frames are intentionally excluded from all measurements below.
@@ -744,6 +887,7 @@ int main(int argc, char** argv) {
               "  p50 %8.2f   p95 %8.2f\n",
               encode_ms.Percentile(0.50), encode_ms.Percentile(0.95));
 
+  const uint64_t reassembly_failures = reasm.failures() + rtp_reasm.failures();
   std::printf("\nReliability\n"
               "  frames received    %llu\n"
               "  sequence gaps      %llu frames in %llu events\n"
@@ -757,16 +901,19 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(seq.gap_events()),
               static_cast<unsigned long long>(seq.reorder_events()),
               static_cast<unsigned long long>(seq.duplicates()),
-              static_cast<unsigned long long>(reasm.failures()),
+              static_cast<unsigned long long>(reassembly_failures),
               static_cast<unsigned long long>(bad_header),
               static_cast<unsigned long long>(wrong_run));
 
-  if (opt.protocol == "raw_udp") {
-    std::printf("  UDP packets recv   %llu\n"
-                "  UDP packets lost   %llu (%.3f %%)\n"
+  if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp") {
+    const char* packet_name = opt.protocol == "rtp_udp" ? "RTP" : "UDP";
+    std::printf("  %s packets recv   %llu\n"
+                "  %s packets lost   %llu (%.3f %%)\n"
                 "  packet reorder     %llu\n"
                 "  packet duplicates  %llu\n",
+                packet_name,
                 static_cast<unsigned long long>(packets.received()),
+                packet_name,
                 static_cast<unsigned long long>(packets.missing()),
                 packets.loss_pct(),
                 static_cast<unsigned long long>(packets.reorder_events()),
@@ -837,13 +984,14 @@ int main(int argc, char** argv) {
               "  • True wire overhead needs a packet capture; the figure above\n"
               "    counts application bytes only and cannot see retransmits.\n");
 
-  const uint64_t summary_packets_received = opt.protocol == "raw_udp"
+  const bool udp_protocol = opt.protocol == "raw_udp" || opt.protocol == "rtp_udp";
+  const uint64_t summary_packets_received = udp_protocol
       ? packets.received()
       : tcp_segments;
-  const uint64_t summary_packets_lost = opt.protocol == "raw_udp"
+  const uint64_t summary_packets_lost = udp_protocol
       ? packets.missing() : tcp_retrans;
   log.WriteSummary(seq.received(), seq.gap_frames(), seq.reorder_events(),
-                   seq.duplicates(), reasm.failures(), bytes_payload, bytes_wire,
+                   seq.duplicates(), reassembly_failures, bytes_payload, bytes_wire,
                    have_after ? sync_after.offset_ns : 0, drift_ns,
                    clock_suspect || !have_after,
                    summary_packets_received, summary_packets_lost,

@@ -83,6 +83,7 @@ typedef enum {
 #define UCV_PORT_SRT      8202
 #define UCV_PORT_SIGNAL   8203
 #define UCV_PORT_HLS      8204
+#define UCV_PORT_RTP      5004
 #define UCV_PORT_RTSP     8554
 #define UCV_PORT_RTMPS    1935
 

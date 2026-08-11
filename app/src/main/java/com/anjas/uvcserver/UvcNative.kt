@@ -32,8 +32,8 @@ object UvcNative {
      * implementation fail here rather than falling back to another
      * transport, so a run can never be mislabelled.
      *
-     * [peerCfg] is transport specific — "ip:port" for Raw UDP, a port for
-     * MJPEG.
+     * [peerCfg] is transport specific — "ip:port" for Raw UDP/RTP, a port
+     * for MJPEG.
      *
      * Fails if a hardware H.264 encoder cannot be confirmed: a software
      * encoder changes the encode cost inside every latency number.

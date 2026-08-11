@@ -175,6 +175,7 @@ add_library(uvcserver SHARED
     jni_bridge.c
     ucv_transport.c
     ucv_transport_mjpeg.c
+    ucv_transport_rtp.c
     ucv_control.c
     ucv_encoder.c
     ucv_pipeline.c

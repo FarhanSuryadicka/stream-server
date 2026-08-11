@@ -12,7 +12,7 @@ to be measured; the "Status" column says exactly what exists.
 | 4 | Raw UDP | ✅ implemented, compiled | ✅ implemented, tested E2E | ✅ **yes — ready to measure on-device** |
 | 5 | MJPEG/HTTP | ✅ camera JPEG passthrough, compiled | ✅ HTTP multipart reader, compiled | ⚠️ needs on-device validation |
 | 2 | SRT | ⛔ stub | ⛔ | ❌ needs libsrt |
-| 3 | RTSP/RTP | ⛔ stub | ⛔ | ❌ needs RTP stack |
+| 3 | RTP/UDP data plane | ✅ RFC 6184 sender | ✅ measured receiver | ⚠️ RTSP signalling pending |
 | 1 | WebRTC | ⛔ stub | ⛔ | ❌ needs libdatachannel |
 | 6 | RTMPS | ⛔ stub | ⛔ | ❌ needs librtmp + server |
 | 7 | HLS/DASH | ⛔ stub | ⛔ | ❌ needs segmenter |
@@ -157,18 +157,23 @@ Notes that will cost time if discovered late:
 
 ## 5. RTSP / RTP over UDP — protocol #3
 
+**Current status: RTP/UDP data plane implemented; RTSP signalling pending.**
+Android packetises H.264 as RFC 6184 single-NAL/FU-A packets. The PC receiver
+reads the RFC 8285 measurement extension, accounts for every RTP datagram,
+reorders fragments by explicit index, reconstructs Annex-B H.264 for preview,
+and writes the same NDJSON metrics as Raw UDP. The shared control channel
+starts the stream directly on UDP port 5004.
+
 Two parts: an RTSP control server (TCP, `DESCRIBE`/`SETUP`/`PLAY`) and RTP
 packetisation (RFC 6184 for H.264).
 
-- Instrumentation rides in an **RTP header extension** (RFC 8285), not the
-  binary preamble — otherwise the stream is not real RTSP and any player
-  comparison is meaningless.
-- FU-A fragmentation for NALs over MTU.
-- PC side: ffmpeg/GStreamer can validate interoperability, but the measuring
-  receiver must read the extension, so a small custom RTP reader is needed.
+- Instrumentation rides in an **RTP header extension** (RFC 8285).
+- FU-A fragmentation for NALs over MTU is implemented.
+- The custom PC RTP reader is implemented; ffmpeg/GStreamer interoperability
+  validation remains.
+- Remaining: RTSP control server (`DESCRIBE`/`SETUP`/`PLAY`) and SDP exposure.
 
-**Estimate: 5–7 days.** Consider vendoring a small RTSP library instead of
-hand-rolling.
+Do not label current measurements as full RTSP. They measure RTP/UDP only.
 
 ---
 

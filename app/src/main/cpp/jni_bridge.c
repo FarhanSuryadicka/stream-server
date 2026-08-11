@@ -759,7 +759,8 @@ static int remote_start(const char *peer_ip,
                         const ucv_start_run_payload_t *request) {
   if (!request ||
       (request->protocol_id != UCV_PROTO_RAWUDP &&
-       request->protocol_id != UCV_PROTO_MJPEG) ||
+       request->protocol_id != UCV_PROTO_MJPEG &&
+       request->protocol_id != UCV_PROTO_RTSP) ||
       !request->width || !request->height || !request->fps)
     return -EINVAL;
   stop_experiment_native();
@@ -769,7 +770,9 @@ static int remote_start(const char *peer_ip,
              request->video_port ? request->video_port : UCV_PORT_MJPEG);
   } else {
     snprintf(peer, sizeof(peer), "%s:%u", peer_ip,
-             request->video_port ? request->video_port : UCV_PORT_RAWUDP);
+             request->video_port ? request->video_port :
+             (request->protocol_id == UCV_PROTO_RTSP
+                  ? UCV_PORT_RTP : UCV_PORT_RAWUDP));
   }
   LOGI("remote START: proto=%u %ux%u@%u cfg=%s", request->protocol_id,
        request->width, request->height, request->fps, peer);

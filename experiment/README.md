@@ -89,10 +89,11 @@ competing for isochronous USB bandwidth.
   56/32/40 bytes so a padding change breaks the build instead of silently
   corrupting measurements
 - Clock synchronisation (SNTP-style, 64 probes, lowest-RTT wins)
-- Android: Raw UDP transport, instrumented MJPEG transport, control channel,
-  encoder, pipeline — compiled into `libuvcserver.so`, symbols verified
-- PC: `ucv-receiver` — Raw UDP receive/reassembly, UDP packet loss, MJPEG/TCP
-  retransmission-rate, jitter accounting, control-RTT-under-load, NDJSON logging
+- Android: Raw UDP, RFC 6184 RTP/UDP, instrumented MJPEG transport, control
+  channel, encoder, and shared pipeline
+- PC: `ucv-receiver` — Raw UDP/RTP receive and reassembly, packet loss,
+  MJPEG/TCP retransmission-rate, jitter accounting, control-RTT-under-load,
+  NDJSON logging
 - `ucv-selftest` (34 checks) and `ucv-nv12test` — both passing
 - `ucv-mocksender` — phone stand-in; the whole path was validated end-to-end
   on one machine, including synthetic loss the receiver correctly reported
@@ -100,8 +101,8 @@ competing for isochronous USB bandwidth.
 
 **Not built yet:**
 
-- SRT, RTSP/RTP, WebRTC, RTMPS, HLS transports (stubs return NULL, deliberately)
-- MJPEG receiver on the PC side (sender is done)
+- SRT, WebRTC, RTMPS, and HLS transports (stubs return NULL, deliberately)
+- RTSP signalling for the implemented RTP/UDP data plane
 
 ### Status: ready for on-device bring-up
 

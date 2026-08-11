@@ -449,6 +449,11 @@ retransmission adalah bukti pemulihan transport, bukan frame akhir yang hilang.
 Jika perangkat tidak menyediakan `TCP_INFO`, dashboard jatuh kembali ke
 observed frame loss dan menandainya dengan label berbeda.
 
+Untuk **RTP/UDP**, dashboard memakai `packet_seq` pada extension RFC 8285 dan
+menampilkan **Observed RTP packet loss** realtime. Pilihan `RTP/UDP (H.264)`
+saat ini menguji data plane langsung pada UDP 5004. Ia belum menjalankan RTSP
+`DESCRIBE/SETUP/PLAY`, sehingga hasil harus diberi nama RTP/UDP, bukan RTSP.
+
 ### Statistik lain yang tetap dicatat
 
 Walaupun grafik utama fokus pada latency, jitter, dan loss, NDJSON masih

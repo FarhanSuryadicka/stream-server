@@ -105,6 +105,24 @@ by TCP; it is not final media loss.
 the dashboard falls back to observed frame gaps instead of inventing a packet
 loss value. Header text overhead is counted in `wire_overhead_pct`, not excused.
 
+### 1.3 RTP/UDP H.264 header extension
+
+The RTP data plane uses RFC 6184 packetisation: single-NAL packets where the
+NAL fits and FU-A fragments otherwise. Payload type is dynamic `96`, the clock
+rate is 90 kHz, and the marker bit identifies the last packet of an access
+unit.
+
+Every RTP packet sets the extension bit and carries an RFC 8285 two-byte header
+extension (`defined-by-profile=0x1000`). Element id `1`, length `56`, contains
+the complete `ucv_frame_header_t`. `packet_seq` therefore provides 32-bit loss
+accounting without the 16-bit RTP sequence wrap ambiguity, while
+`fragment_index/count` permits reordered FU-A packets to be reconstructed.
+The extension is padded to 60 bytes as required by RTP's 32-bit alignment.
+
+This implementation is currently the directly controlled **RTP/UDP data
+plane**. RTSP `DESCRIBE`/`SETUP`/`PLAY` signalling on port 8554 is not yet
+implemented and must not be claimed in results.
+
 ---
 
 ## 2. Control message (upstream: PC → phone)
@@ -234,6 +252,7 @@ sequence-gap analysis cannot see a tail-end loss:
 | `1935` | RTMPS |
 | `8203` | WebRTC signalling (WebSocket) |
 | `8204` | HLS/DASH HTTP |
+| `5004` | RTP/UDP H.264 data plane |
 
 Control is a **dedicated port for every protocol**, including those with a
 native back-channel. That keeps the control measurement methodology identical

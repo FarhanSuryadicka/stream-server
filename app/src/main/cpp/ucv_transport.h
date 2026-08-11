@@ -77,6 +77,7 @@ ucv_transport_t *ucv_transport_get(ucv_protocol_t proto);
 /* Individual constructors — exposed for testing. */
 ucv_transport_t *ucv_transport_rawudp(void);
 ucv_transport_t *ucv_transport_mjpeg(void);
+ucv_transport_t *ucv_transport_rtp(void);
 ucv_transport_t *ucv_transport_srt(void);
 ucv_transport_t *ucv_transport_rtsp(void);
 ucv_transport_t *ucv_transport_webrtc(void);
