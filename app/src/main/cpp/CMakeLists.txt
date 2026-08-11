@@ -19,6 +19,37 @@ set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
 set(ENABLE_STDCXX_SYNC ON CACHE BOOL "" FORCE)
 add_subdirectory(srt EXCLUDE_FROM_ALL)
 
+# WebRTC via libdatachannel. Unlike the other protocols this one cannot be
+# hand-rolled: WebRTC mandates DTLS-SRTP, so a crypto stack is not optional, and
+# shipping plaintext RTP labelled "webrtc" would be the worst kind of
+# mislabelled run. libdatachannel is the small implementation (vs Google's
+# libwebrtc) and is sufficient here.
+#
+# Mbed TLS is the crypto backend — smallest NDK footprint, as already noted for
+# SRT in experiment/docs/03-implementation-plan.md section 4.
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mbedtls-vendored.cmake)
+
+set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+# Signalling is deliberately NOT taken from libdatachannel's WebSocket support.
+# The harness needs to record signalling as its own operational cost (WebRTC is
+# the only protocol here that needs a rendezvous server at all), and a plain TCP
+# exchange we own is both smaller and easier to instrument than pulling in a
+# WebSocket + TLS client we would not otherwise use.
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# libSRTP's test apps are on by default and want the stripped test/ tree plus a
+# system libpcap; neither exists in an NDK cross-build.
+set(LIBSRTP_TEST_APPS OFF CACHE BOOL "" FORCE)
+# Vendored third-party code is not this project's to keep warning-clean, and
+# -Werror across four upstream libraries turns any NDK version bump into a
+# build break.
+set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+add_subdirectory(libdatachannel EXCLUDE_FROM_ALL)
+
 # Native JPEG codec for the dewarp pipeline (decode camera MJPEG -> RGB,
 # encode dewarped RGB -> JPEG) — replaces the earlier Kotlin/Bitmap JNI
 # round-trip so decode/encode run in C alongside the GLES render, no per-

@@ -134,7 +134,12 @@ add_library(mbedx509  STATIC ${UCV_MBEDX509_SOURCES})
 add_library(mbedtls   STATIC ${UCV_MBEDTLS_SOURCES})
 
 foreach(_t mbedcrypto mbedx509 mbedtls)
-    target_include_directories(${_t} PUBLIC ${UCV_MBEDTLS_DIR}/include)
+    # BUILD_INTERFACE, not a bare path: these targets land in the export sets
+    # above, and CMake rejects exporting a source-directory include path that has
+    # no install-tree counterpart. Nothing is ever installed here, so scoping the
+    # path to the build is both correct and sufficient.
+    target_include_directories(${_t}
+        PUBLIC $<BUILD_INTERFACE:${UCV_MBEDTLS_DIR}/include>)
     # DTLS-SRTP is the whole point here: WebRTC mandates it, and libdatachannel
     # asks Mbed TLS for the SRTP keying material through this option. It is NOT
     # in the default config, so leaving it off fails at link time with a missing
@@ -157,3 +162,14 @@ add_library(MbedTLS::mbedtls    ALIAS mbedtls)
 add_library(ucv_mbedtls_all INTERFACE)
 target_link_libraries(ucv_mbedtls_all INTERFACE mbedtls mbedx509 mbedcrypto)
 add_library(MbedTLS::MbedTLS ALIAS ucv_mbedtls_all)
+
+# libdatachannel and libSRTP both declare install(EXPORT ...) rules, and CMake
+# refuses to export a target that links something outside the export set — even
+# though nothing here is ever installed (everything is statically linked into
+# libuvcserver.so). Registering these targets in the same export sets satisfies
+# that check. Must happen BEFORE add_subdirectory, because install(EXPORT ...)
+# is evaluated inside those projects.
+install(TARGETS mbedtls mbedx509 mbedcrypto ucv_mbedtls_all
+        EXPORT LibDataChannelTargets)
+install(TARGETS mbedtls mbedx509 mbedcrypto
+        EXPORT libSRTPTargets)
