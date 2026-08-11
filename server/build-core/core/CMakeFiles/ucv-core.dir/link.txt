@@ -1,2 +1,0 @@
-C:\Users\user\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\ar.exe qc libucv-core.a CMakeFiles/ucv-core.dir/src/metrics.cpp.obj CMakeFiles/ucv-core.dir/src/ndjson_reader.cpp.obj CMakeFiles/ucv-core.dir/src/receiver_process.cpp.obj
-C:\Users\user\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\ranlib.exe libucv-core.a

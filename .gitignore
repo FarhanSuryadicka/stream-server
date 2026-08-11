@@ -20,3 +20,9 @@ local.properties
 # with `git add -f`, rather than having every scratch run swept in.
 /experiment/receiver/build/
 /experiment/results/
+
+# Qt/CMake build output for the desktop app.
+/server/build/
+/server/build-core/
+/server/build-dbg/
+aqtinstall.log

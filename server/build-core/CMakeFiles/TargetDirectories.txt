@@ -1,8 +1,0 @@
-C:/Users/user/stream-server/server/build-core/CMakeFiles/test.dir
-C:/Users/user/stream-server/server/build-core/CMakeFiles/edit_cache.dir
-C:/Users/user/stream-server/server/build-core/CMakeFiles/rebuild_cache.dir
-C:/Users/user/stream-server/server/build-core/core/CMakeFiles/ucv-core.dir
-C:/Users/user/stream-server/server/build-core/core/CMakeFiles/ucv-core-test.dir
-C:/Users/user/stream-server/server/build-core/core/CMakeFiles/test.dir
-C:/Users/user/stream-server/server/build-core/core/CMakeFiles/edit_cache.dir
-C:/Users/user/stream-server/server/build-core/core/CMakeFiles/rebuild_cache.dir

@@ -64,13 +64,10 @@ Requires Qt 6.5+ and CMake 3.21+. Qt is **not** vendored — it is a large
 external SDK and `FUTURE-SERVER-ARCHITECTURE.md` §6 explicitly warns against
 adding it to the tree speculatively.
 
-```powershell
-cmake -S server -B server/build -DCMAKE_PREFIX_PATH="C:/Qt/6.8.0/mingw_64"
-cmake --build server/build --config Release
-```
+### Core only — no Qt needed
 
-The core library and its tests build **without** Qt, which is useful on a
-machine that has no Qt installed:
+Useful on any machine, and the fastest way to check that the measurement logic
+is intact:
 
 ```powershell
 cmake -S server -B server/build-core -DUCV_BUILD_UI=OFF
@@ -78,12 +75,59 @@ cmake --build server/build-core
 ctest --test-dir server/build-core --output-on-failure
 ```
 
+### Full application
+
+**Use the MinGW that built your Qt.** This is not optional on Windows and cost
+a long debugging session to learn: Qt's prebuilt binaries ship their own
+`libstdc++-6.dll`, and Qt6Core imports from it. A newer GCC links fine and then
+the application fails to *start* with
+
+```text
+The procedure entry point _ZNKSt25__codecvt_utf8_utf16... could not be located
+```
+
+Nothing in the build log hints at it, and static-linking the runtime does not
+help, because the missing symbol is imported by Qt's DLLs rather than by this
+binary. `CMakeLists.txt` warns when it detects a likely mismatch.
+
+Qt 6.8.1 is built with GCC 13.1.0. If you installed Qt with `aqtinstall`, the
+matching toolchain is one command away:
+
+```powershell
+pip install aqtinstall
+python -m aqt install-qt   windows desktop 6.8.1 win64_mingw -O C:/Qt
+python -m aqt install-tool windows desktop tools_mingw1310    -O C:/Qt
+```
+
+```powershell
+cmake -S server -B server/build -G "MinGW Makefiles" `
+      -DCMAKE_PREFIX_PATH="C:/Qt/6.8.1/mingw_64" `
+      -DCMAKE_C_COMPILER="C:/Qt/Tools/mingw1310_64/bin/gcc.exe" `
+      -DCMAKE_CXX_COMPILER="C:/Qt/Tools/mingw1310_64/bin/g++.exe" `
+      -DCMAKE_MAKE_PROGRAM="C:/Qt/Tools/mingw1310_64/bin/mingw32-make.exe"
+cmake --build server/build -j 8
+```
+
+CMake caches the compiler, so **after changing toolchain or Qt version, delete
+the build directory** rather than reconfiguring in place — a stale cache silently
+keeps building with the old compiler and produces a binary that fails only at
+startup:
+
+```powershell
+Remove-Item -Recurse -Force server/build
+```
+
 ## Running
 
-The application needs `ucv-receiver.exe` built first
-(`experiment/build-receiver.ps1`). It locates it relative to the repository
-root, the same way the Python dashboard does.
+Needs `ucv-receiver.exe` built first (`experiment/build-receiver.ps1`). The app
+finds it relative to the repository root, exactly as the Python dashboard does.
 
 ```powershell
 server/build/ui/ucv-monitor.exe
 ```
+
+The build runs `windeployqt`, so the Qt runtime sits beside the executable and
+it launches by double-click with no PATH setup. That matters for more than
+convenience: Git for Windows ships a conflicting `libstdc++-6.dll` on a
+directory that is on nearly every PATH, and Windows searches the executable's
+own directory first.
