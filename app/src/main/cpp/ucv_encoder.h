@@ -62,9 +62,24 @@ void ucv_encoder_destroy(ucv_encoder_t *enc);
 
 void ucv_encoder_get_info(const ucv_encoder_t *enc, ucv_encoder_info_t *out);
 
+/* Direct-input path used by the capture pipeline. Acquire returns:
+ *   1  a writable MediaCodec input buffer is available
+ *   0  the codec is busy; the frame should be dropped without decoding
+ *  <0  invalid state/error
+ *
+ * Exactly one input buffer may be held at a time. It must be followed by
+ * queue_input() or discard_input(). Writing the decoded NV12 image directly
+ * into this buffer avoids a full-frame copy on every submitted frame. */
+int ucv_encoder_acquire_input(ucv_encoder_t *enc, uint8_t **out_data,
+                              size_t *out_capacity, int timeout_us);
+int ucv_encoder_queue_input(ucv_encoder_t *enc, size_t size,
+                            int64_t pts_us);
+int ucv_encoder_discard_input(ucv_encoder_t *enc);
+
 /* Submits one NV12 frame. `pts_us` must be monotonic; MediaCodec uses it for
  * rate control, and a non-monotonic value quietly degrades output quality.
- * Returns 0 on success, negative on error. */
+ * Compatibility wrapper for callers that do not use the direct-input path;
+ * it performs one copy. Returns 0 on success/drop, negative on error. */
 int ucv_encoder_submit_nv12(ucv_encoder_t *enc, const uint8_t *nv12,
                             size_t size, int64_t pts_us);
 
@@ -101,10 +116,19 @@ typedef struct ucv_jpeg_decoder ucv_jpeg_decoder_t;
 ucv_jpeg_decoder_t *ucv_jpeg_decoder_create(int width, int height);
 void                ucv_jpeg_decoder_destroy(ucv_jpeg_decoder_t *d);
 
+/* Decodes into caller-owned contiguous NV12 storage. This is the production
+ * pipeline path: `nv12` can point directly at a MediaCodec input buffer.
+ * Returns 0 and sets *out_size on success. The destination is not accessed
+ * when its capacity is smaller than width*height*3/2. */
+int ucv_jpeg_decode_into_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
+                              size_t jpeg_size, uint8_t *nv12,
+                              size_t nv12_capacity, size_t *out_size);
+
 /* Decodes a JPEG into the decoder's internal NV12 buffer. The decoder also
  * retains its libjpeg state across calls, so create one per pipeline run rather
  * than one per frame. Returns 0 on success; *out_nv12 / *out_size point at
- * internal storage valid until the next decode call. */
+ * lazy-allocated internal storage valid until the next decode call. This
+ * compatibility API is also used by the host smoke test. */
 int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
                             size_t jpeg_size, const uint8_t **out_nv12,
                             size_t *out_size);

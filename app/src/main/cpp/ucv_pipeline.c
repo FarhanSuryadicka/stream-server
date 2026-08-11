@@ -195,11 +195,24 @@ static void *capture_thread(void *arg) {
     if (g_stats.frames_captured == 1)
       PLOG("pipeline: FIRST FRAME CAPTURED (%zu bytes)", fr->data_bytes);
 
-    const uint8_t *nv12 = NULL;
+    uint8_t *nv12 = NULL;
+    size_t nv12_capacity = 0;
     size_t nv12_size = 0;
+    const int acquired =
+        ucv_encoder_acquire_input(g_enc, &nv12, &nv12_capacity, 5000);
+    if (acquired <= 0) {
+      /* Busy is a normal bounded drop and is already counted by the encoder.
+       * Crucially, no JPEG work was spent on a frame that cannot be queued. */
+      if (acquired < 0)
+        PLOGE("pipeline: failed to acquire encoder input buffer");
+      continue;
+    }
+
     const uint64_t t_dec0 = now_ns();
-    if (ucv_jpeg_decode_to_nv12(g_dec, (const uint8_t *)fr->data,
-                                fr->data_bytes, &nv12, &nv12_size) != 0) {
+    if (ucv_jpeg_decode_into_nv12(g_dec, (const uint8_t *)fr->data,
+                                  fr->data_bytes, nv12, nv12_capacity,
+                                  &nv12_size) != 0) {
+      (void)ucv_encoder_discard_input(g_enc);
       pthread_mutex_lock(&g_stats_lock);
       g_stats.decode_errors++;
       const uint64_t n = g_stats.decode_errors;
@@ -220,7 +233,7 @@ static void *capture_thread(void *arg) {
     pts_us = (int64_t)(t_cap / 1000ull);
     pts_put(pts_us, t_cap);
 
-    if (ucv_encoder_submit_nv12(g_enc, nv12, nv12_size, pts_us) == 0) {
+    if (ucv_encoder_queue_input(g_enc, nv12_size, pts_us) == 0) {
       pthread_mutex_lock(&g_stats_lock);
       g_stats.frames_decoded++;
       if (dec_n)
@@ -381,7 +394,8 @@ int ucv_pipeline_start(void *strmh, ucv_protocol_t proto, const char *peer_cfg,
            info.keyframe_interval_s,
            info.hardware_accelerated == 1
                ? "yes"
-               : (info.hardware_accelerated == 0 ? "NO" : "undetermined"));
+                : (info.hardware_accelerated == 0 ? "NO" : "undetermined"));
+  PLOG("pipeline: direct JPEG -> MediaCodec NV12 input enabled");
   }
 
   /* Echo the peer back: a typo in the PC address produces a run where the
@@ -444,6 +458,11 @@ void ucv_pipeline_stop(void) {
   if (g_tx)
     g_tx->stop(g_tx);
   if (g_enc) {
+    /* Preserve input-saturation drops in the final stopped summary before
+     * destroying the encoder that owns the live counter. */
+    pthread_mutex_lock(&g_stats_lock);
+    g_stats.encoder_drops += ucv_encoder_drops(g_enc);
+    pthread_mutex_unlock(&g_stats_lock);
     ucv_encoder_destroy(g_enc);
     g_enc = NULL;
   }

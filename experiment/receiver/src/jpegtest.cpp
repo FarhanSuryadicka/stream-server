@@ -170,6 +170,58 @@ static void TestRawSubsamplingLayouts() {
   ucv_jpeg_decoder_destroy(decoder);
 }
 
+static void TestCallerOwnedOutput() {
+  std::printf("\n[jpeg] decoder writes directly into caller-owned NV12\n");
+  constexpr int kWidth = 18;
+  constexpr int kHeight = 10;
+  constexpr size_t kGuard = 16;
+  constexpr uint8_t kSentinel = 0xA5;
+  const size_t expected_size =
+      static_cast<size_t>(kWidth) * kHeight * 3 / 2;
+  const auto jpeg = MakeSolidJpeg(kWidth, kHeight, 40, 160, 210);
+  ucv_jpeg_decoder_t* decoder =
+      ucv_jpeg_decoder_create(kWidth, kHeight);
+  CHECK(decoder != nullptr, "external-output decoder is created");
+  if (!decoder) return;
+
+  std::vector<uint8_t> guarded(expected_size + kGuard * 2, kSentinel);
+  uint8_t* destination = guarded.data() + kGuard;
+  size_t output_size = 0;
+  int rc = ucv_jpeg_decode_into_nv12(
+      decoder, jpeg.data(), jpeg.size(), destination, expected_size - 1,
+      &output_size);
+  CHECK(rc < 0, "undersized destination is rejected before decode");
+  bool untouched = true;
+  for (uint8_t value : guarded)
+    if (value != kSentinel) untouched = false;
+  CHECK(untouched, "undersized destination remains untouched");
+
+  rc = ucv_jpeg_decode_into_nv12(
+      decoder, jpeg.data(), jpeg.size(), destination, expected_size,
+      &output_size);
+  CHECK(rc == 0, "JPEG decodes into caller-owned storage");
+  CHECK(output_size == expected_size, "external output reports exact NV12 size");
+  bool guards_ok = true;
+  for (size_t i = 0; i < kGuard; ++i) {
+    if (guarded[i] != kSentinel ||
+        guarded[kGuard + expected_size + i] != kSentinel)
+      guards_ok = false;
+  }
+  CHECK(guards_ok, "external decode stays inside destination bounds");
+
+  const uint64_t external_checksum = Checksum(destination, expected_size);
+  const uint8_t* internal = nullptr;
+  size_t internal_size = 0;
+  rc = ucv_jpeg_decode_to_nv12(decoder, jpeg.data(), jpeg.size(),
+                               &internal, &internal_size);
+  CHECK(rc == 0 && internal_size == expected_size,
+        "compatibility decoder remains available");
+  CHECK(rc == 0 && Checksum(internal, internal_size) == external_checksum,
+        "external and compatibility paths produce identical NV12");
+
+  ucv_jpeg_decoder_destroy(decoder);
+}
+
 static void TestPersistentDecodeAndRecovery() {
   constexpr int kWidth = 18;
   constexpr int kHeight = 10;
@@ -227,6 +279,7 @@ int main() {
   std::printf("=========================================\n");
   TestCreateGuards();
   TestRawSubsamplingLayouts();
+  TestCallerOwnedOutput();
   TestPersistentDecodeAndRecovery();
 
   std::printf("\n=========================================\n");

@@ -68,6 +68,10 @@ struct ucv_encoder {
   uint8_t *out_buf;
   size_t   out_cap;
 
+  /* One input buffer may be held while libjpeg writes NV12 into it. */
+  ssize_t  input_index;
+  size_t   input_capacity;
+
   uint64_t frames_in;
   uint64_t frames_out;
   uint64_t drops;
@@ -133,6 +137,7 @@ ucv_encoder_t *ucv_encoder_create(const ucv_encoder_config_t *cfg) {
   ucv_encoder_t *e = (ucv_encoder_t *)calloc(1, sizeof(*e));
   if (!e)
     return NULL;
+  e->input_index = -1;
 
   e->codec = AMediaCodec_createEncoderByType("video/avc");
   if (!e->codec) {
@@ -230,38 +235,100 @@ void ucv_encoder_get_info(const ucv_encoder_t *e, ucv_encoder_info_t *out) {
     *out = e->info;
 }
 
+int ucv_encoder_acquire_input(ucv_encoder_t *e, uint8_t **out_data,
+                              size_t *out_capacity, int timeout_us) {
+  if (!out_data || !out_capacity)
+    return -1;
+  *out_data = NULL;
+  *out_capacity = 0;
+  if (!e || e->input_index >= 0)
+    return -1;
+
+  /* Reject a frame before decoding when the codec is saturated. A bounded
+   * wait preserves the capture pacing used by the experiment. */
+  ssize_t idx = AMediaCodec_dequeueInputBuffer(e->codec, timeout_us);
+  if (idx < 0) {
+    e->drops++;
+    return 0;
+  }
+
+  size_t capacity = 0;
+  uint8_t *data = AMediaCodec_getInputBuffer(e->codec, (size_t)idx, &capacity);
+  e->input_index = idx;
+  e->input_capacity = capacity;
+  if (!data) {
+    ELOGE_BOTH("AMediaCodec_getInputBuffer returned NULL");
+    (void)ucv_encoder_discard_input(e);
+    e->drops++;
+    return -1;
+  }
+
+  *out_data = data;
+  *out_capacity = capacity;
+  return 1;
+}
+
+int ucv_encoder_queue_input(ucv_encoder_t *e, size_t size, int64_t pts_us) {
+  if (!e || e->input_index < 0)
+    return -1;
+  if (size > e->input_capacity) {
+    ELOGE_BOTH("input buffer too small: cap=%zu need=%zu",
+               e->input_capacity, size);
+    (void)ucv_encoder_discard_input(e);
+    e->drops++;
+    return -1;
+  }
+
+  const size_t idx = (size_t)e->input_index;
+  e->input_index = -1;
+  e->input_capacity = 0;
+  media_status_t st =
+      AMediaCodec_queueInputBuffer(e->codec, idx, 0, size, pts_us, 0);
+  if (st != AMEDIA_OK) {
+    ELOGE_BOTH("queueInputBuffer failed: %d", (int)st);
+    e->drops++;
+    return -1;
+  }
+  e->frames_in++;
+  return 0;
+}
+
+int ucv_encoder_discard_input(ucv_encoder_t *e) {
+  if (!e || e->input_index < 0)
+    return -1;
+
+  const size_t idx = (size_t)e->input_index;
+  e->input_index = -1;
+  e->input_capacity = 0;
+  /* MediaCodec exposes no cancel-input call. Queueing an empty, flagless
+   * buffer returns ownership without submitting a video frame. */
+  media_status_t st = AMediaCodec_queueInputBuffer(e->codec, idx, 0, 0, 0, 0);
+  if (st != AMEDIA_OK) {
+    ELOGE_BOTH("discard input buffer failed: %d", (int)st);
+    return -1;
+  }
+  return 0;
+}
+
 int ucv_encoder_submit_nv12(ucv_encoder_t *e, const uint8_t *nv12, size_t size,
                             int64_t pts_us) {
   if (!e || !nv12)
     return -1;
 
-  /* Short timeout, not infinite: if the encoder is saturated we would rather
-   * drop this frame and keep capture running than stall the capture thread
-   * and distort the frame pacing the whole measurement rests on. */
-  ssize_t idx = AMediaCodec_dequeueInputBuffer(e->codec, 5000);
-  if (idx < 0) {
-    e->drops++;
-    return 0; /* not fatal — counted and reported */
-  }
-
+  uint8_t *buf = NULL;
   size_t cap = 0;
-  uint8_t *buf = AMediaCodec_getInputBuffer(e->codec, (size_t)idx, &cap);
-  if (!buf || cap < size) {
+  const int acquired = ucv_encoder_acquire_input(e, &buf, &cap, 5000);
+  if (acquired <= 0)
+    return acquired < 0 ? -1 : 0;
+  if (cap < size) {
     ELOGE_BOTH("input buffer too small: cap=%zu need=%zu", cap, size);
-    AMediaCodec_queueInputBuffer(e->codec, (size_t)idx, 0, 0, pts_us, 0);
+    (void)ucv_encoder_discard_input(e);
     e->drops++;
     return -1;
   }
 
   memcpy(buf, nv12, size);
-  media_status_t st = AMediaCodec_queueInputBuffer(e->codec, (size_t)idx, 0,
-                                                   size, pts_us, 0);
-  if (st != AMEDIA_OK) {
-    ELOGE_BOTH("queueInputBuffer failed: %d", (int)st);
-    return -1;
-  }
-  e->frames_in++;
-  return 0;
+  return ucv_encoder_queue_input(e, size, pts_us);
 }
 
 static int ensure_out_cap(ucv_encoder_t *e, size_t need) {
@@ -312,6 +379,14 @@ int ucv_encoder_drain(ucv_encoder_t *e, const uint8_t **out_data,
         ELOG_BOTH("encoder: captured %zu-byte codec config (SPS/PPS)",
                   e->csd_size);
       }
+      AMediaCodec_releaseOutputBuffer(e->codec, (size_t)idx, false);
+      continue;
+    }
+
+    /* Empty input buffers return a slot after a JPEG decode failure. Most
+     * codecs emit nothing for them; ignore a zero-sized output defensively if
+     * a vendor codec surfaces one. */
+    if (info.size <= 0) {
       AMediaCodec_releaseOutputBuffer(e->codec, (size_t)idx, false);
       continue;
     }
@@ -431,11 +506,6 @@ ucv_jpeg_decoder_t *ucv_jpeg_decoder_create(int width, int height) {
   d->width = width;
   d->height = height;
   d->nv12_size = (size_t)width * height * 3 / 2;
-  d->nv12 = (uint8_t *)malloc(d->nv12_size);
-  if (!d->nv12) {
-    ucv_jpeg_decoder_destroy(d);
-    return NULL;
-  }
   d->raw_stride = ((size_t)width + DCTSIZE - 1) / DCTSIZE * DCTSIZE;
   const size_t raw_bytes = d->raw_stride * UCV_JPEG_RAW_ROWS;
   for (int component = 0; component < UCV_JPEG_COMPONENTS; component++) {
@@ -500,10 +570,11 @@ static int jpeg_raw_layout(const struct jpeg_decompress_struct *cinfo,
   return 1;
 }
 
-int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
-                            size_t jpeg_size, const uint8_t **out_nv12,
-                            size_t *out_size) {
-  if (!d || !jpeg || !jpeg_size || !out_nv12 || !out_size)
+int ucv_jpeg_decode_into_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
+                              size_t jpeg_size, uint8_t *nv12,
+                              size_t nv12_capacity, size_t *out_size) {
+  if (!d || !jpeg || !jpeg_size || !nv12 || !out_size ||
+      nv12_capacity < d->nv12_size)
     return -1;
 
   struct jpeg_decompress_struct *cinfo = &d->cinfo;
@@ -552,8 +623,8 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
   }
 
   const int w = d->width, h = d->height;
-  uint8_t *Y = d->nv12;
-  uint8_t *UV = d->nv12 + (size_t)w * h;
+  uint8_t *Y = nv12;
+  uint8_t *UV = nv12 + (size_t)w * h;
   const JDIMENSION lines_per_iMCU =
       (JDIMENSION)cinfo->max_v_samp_factor * DCTSIZE;
   JSAMPARRAY planes[UCV_JPEG_COMPONENTS] = {
@@ -602,7 +673,23 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
 
   jpeg_finish_decompress(cinfo);
 
-  *out_nv12 = d->nv12;
   *out_size = d->nv12_size;
+  return 0;
+}
+
+int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
+                            size_t jpeg_size, const uint8_t **out_nv12,
+                            size_t *out_size) {
+  if (!d || !out_nv12 || !out_size)
+    return -1;
+  if (!d->nv12) {
+    d->nv12 = (uint8_t *)malloc(d->nv12_size);
+    if (!d->nv12)
+      return -1;
+  }
+  if (ucv_jpeg_decode_into_nv12(d, jpeg, jpeg_size, d->nv12,
+                                d->nv12_size, out_size) != 0)
+    return -1;
+  *out_nv12 = d->nv12;
   return 0;
 }
