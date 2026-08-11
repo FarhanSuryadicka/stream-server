@@ -203,6 +203,69 @@ void UdpSender::Close() {
   }
 }
 
+// --------------------------------------------------------------- TcpClient
+
+TcpClient::~TcpClient() { Close(); }
+
+bool TcpClient::Connect(const std::string& peer_ip, int port, int timeout_ms) {
+  Close();
+  fd_ = static_cast<SocketHandle>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+  if (fd_ == kInvalidSocket) return false;
+  sockaddr_in peer{};
+  peer.sin_family = AF_INET;
+  peer.sin_port = htons(static_cast<uint16_t>(port));
+  if (inet_pton(AF_INET, peer_ip.c_str(), &peer.sin_addr) != 1) {
+    Close();
+    return false;
+  }
+#ifdef _WIN32
+  DWORD tmo = static_cast<DWORD>(timeout_ms);
+  setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+             reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+  setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+#else
+  timeval tmo{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+  setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
+#endif
+  if (connect(fd_, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) != 0) {
+    Close();
+    return false;
+  }
+  return true;
+}
+
+bool TcpClient::SendAll(const void* data, size_t len) {
+  const char* bytes = static_cast<const char*>(data);
+  size_t off = 0;
+  while (off < len) {
+    const int n = send(fd_, bytes + off, static_cast<int>(len - off), 0);
+    if (n <= 0) return false;
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+int TcpClient::RecvTimeout(void* buf, size_t len, int timeout_ms) {
+  if (fd_ == kInvalidSocket) return -1;
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(fd_, &rfds);
+  timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  const int ready = select(SelectNfds(fd_), &rfds, nullptr, nullptr, &tv);
+  if (ready <= 0) return ready == 0 ? 0 : -1;
+  const int n = recv(fd_, static_cast<char*>(buf), static_cast<int>(len), 0);
+  return n > 0 ? n : -1;
+}
+
+void TcpClient::Close() {
+  if (fd_ != kInvalidSocket) {
+    CLOSESOCK(fd_);
+    fd_ = kInvalidSocket;
+  }
+}
+
 // ------------------------------------------------------------ ControlClient
 
 ControlClient::~ControlClient() { Close(); }

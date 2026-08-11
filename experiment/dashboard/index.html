@@ -66,7 +66,7 @@
       <h2>Start measurement</h2>
       <div class="form-grid">
         <label>Phone IP<input id="phone" value="192.168.137.139"></label>
-        <label>Protocol<select id="protocol"><option>raw_udp</option></select></label>
+        <label>Protocol<select id="protocol"><option value="raw_udp">Raw UDP (H.264)</option><option value="mjpeg">MJPEG over HTTP</option></select></label>
         <label class="wide">Run ID (optional)<input id="runId" placeholder="generated automatically when empty"></label>
         <label>MJPEG resolution<select id="resolution"><option value="">Refresh camera modes first</option></select></label>
         <input id="mode" type="hidden" value="">
@@ -82,10 +82,10 @@
   <section class="panel">
     <div class="toolbar"><h2>Live camera preview</h2><span id="previewState" class="unknown">idle</span></div>
     <div class="preview-wrap">
-      <img id="previewImage" src="/api/preview.mjpeg" alt="Live H.264 camera preview">
+      <img id="previewImage" src="/api/preview.mjpeg" alt="Live camera preview">
       <span class="preview-note" id="previewNote">Preview muncul setelah Start measurement.</span>
     </div>
-    <p class="hint">Preview didekode oleh FFmpeg di PC. Jalur ini hanya salinan lokal setelah frame diterima, sehingga tidak mengambil port UDP 8201 dari pengukur.</p>
+    <p class="hint">Raw UDP didekode oleh FFmpeg; MJPEG ditampilkan langsung. Preview memakai salinan lokal setelah frame diterima dan tidak mengganggu pengukuran.</p>
   </section>
 
   <section class="panel">
@@ -110,7 +110,7 @@
   </section>
 
   <section class="grid">
-    <div class="panel"><div class="toolbar"><h2>Run history</h2><button id="refreshBtn" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Run</th><th>Mode</th><th>State</th><th>Frames</th><th>p50</th><th>p95</th><th>p99</th><th>Jitter</th><th>Loss</th></tr></thead><tbody id="runsBody"></tbody></table></div></div>
+    <div class="panel"><div class="toolbar"><h2>Run history</h2><button id="refreshBtn" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Run</th><th>Protocol</th><th>Mode</th><th>State</th><th>Frames</th><th>p50</th><th>p95</th><th>p99</th><th>Jitter</th><th>Loss</th></tr></thead><tbody id="runsBody"></tbody></table></div></div>
     <div class="panel"><h2>Resolution comparison</h2><div class="table-wrap"><table><thead><tr><th>Comparison group</th><th>Runs</th><th>Frames</th><th>p50 avg</th><th>p95 avg</th><th>p99 avg</th><th>Jitter avg</th><th>Loss avg</th><th>Goodput</th></tr></thead><tbody id="compareBody"></tbody></table></div><p class="hint">Run masuk ke sini hanya setelah diberi <b>Comparison group</b> lewat Save label — tidak otomatis saat run selesai. Rata-rata hanya menghitung run valid. Gunakan ≥3 run per grup.</p></div>
   </section>
 </main>
@@ -131,7 +131,7 @@
 
   async function refreshRuns(){
     const data=await api('/api/runs');runs=data.runs;$('resultsPath').textContent=data.results_dir;
-    $('runsBody').innerHTML=runs.map(r=>`<tr data-file="${esc(r.file)}" class="${r.file===selectedFile?'active':''}"><td>${esc(r.run_id)}</td><td>${esc(r.mode)}</td><td class="${r.valid?'ok':r.clock_status==='RUNNING'?'unknown':'bad'}">${esc(r.clock_status)}</td><td>${r.frames}</td><td>${f(r.transport.p50)}</td><td>${f(r.transport.p95)}</td><td>${f(r.transport.p99)}</td><td>${f(r.jitter_ms)}</td><td>${f(r.loss_pct,3)}%</td></tr>`).join('');
+    $('runsBody').innerHTML=runs.map(r=>`<tr data-file="${esc(r.file)}" class="${r.file===selectedFile?'active':''}"><td>${esc(r.run_id)}</td><td>${esc(r.protocol)}</td><td>${esc(r.mode)}</td><td class="${r.valid?'ok':r.clock_status==='RUNNING'?'unknown':'bad'}">${esc(r.clock_status)}</td><td>${r.frames}</td><td>${f(r.transport.p50)}</td><td>${f(r.transport.p95)}</td><td>${f(r.transport.p99)}</td><td>${f(r.jitter_ms)}</td><td>${f(r.loss_pct,3)}%</td></tr>`).join('');
     document.querySelectorAll('#runsBody tr').forEach(tr=>tr.onclick=()=>selectRun(tr.dataset.file));renderComparison();
     if(!activeFile&&!selectedFile&&runs.length)selectRun((runs.find(r=>r.valid)||runs[0]).file);
   }
@@ -141,7 +141,7 @@
     const ticket=++selectSeq, run=await api('/api/run?file='+encodeURIComponent(file));
     if(ticket!==selectSeq)return;
     selectedRun=run;
-    $('selectedTitle').textContent=`${selectedRun.run_id} · ${selectedRun.mode} · ${selectedRun.condition}`;
+    $('selectedTitle').textContent=`${selectedRun.run_id} · ${selectedRun.protocol} · ${selectedRun.mode}`;
     $('validity').textContent=selectedRun.valid?'VALID RUN':selectedRun.clock_status;$('validity').className=selectedRun.valid?'ok':'bad';
     $('p50').textContent=f(selectedRun.transport.p50);$('p95').textContent=f(selectedRun.transport.p95);$('p99').textContent=f(selectedRun.transport.p99);
     $('jitter').textContent=f(selectedRun.jitter_ms);$('loss').textContent=f(selectedRun.loss_pct,3);$('goodput').textContent=f(selectedRun.goodput_mbps);
@@ -164,7 +164,7 @@
   // The group ROW is still listed while that run is in flight, with the pending
   // count shown: dropping the row entirely made a saved label look lost.
   function renderComparison(){const groups={};
-    runs.filter(r=>r.group).forEach(r=>{const g=groups[r.group]??={valid:[],pending:0};
+    runs.filter(r=>r.group).forEach(r=>{const key=`${r.protocol} / ${r.group}`,g=groups[key]??={valid:[],pending:0};
       r.valid?g.valid.push(r):(r.clock_status==='RUNNING'&&g.pending++)});
     const rows=Object.entries(groups).filter(([,g])=>g.valid.length||g.pending).sort();
     // Name the runs behind each average. A bare count ("1") cannot be traced
@@ -206,7 +206,7 @@
     // the right-most tick.
     if(!hasT){x.fillStyle='#66736b';x.textAlign='right';x.fillText('frame →',w-pad.r,h-9);x.textAlign='left'}}
   function drawCharts(series){drawMetric('latencyChart',series,'latency','#397f91',5,0);drawMetric('jitterChart',series,'jitter','#d7913d',1,1);drawMetric('lossChart',series,'loss','#b44b4b',.1,2)}
-  async function pollSession(){try{const s=await api('/api/session');$('sessionState').textContent=s.state;$('sessionState').className=s.state==='complete'?'ok':s.state==='failed'?'bad':'unknown';$('console').textContent=(s.output||[]).join('\n')||'No active session.';$('console').scrollTop=$('console').scrollHeight;$('startBtn').disabled=['starting','running'].includes(s.state);$('stopBtn').disabled=!['starting','running'].includes(s.state);const p=s.preview||{status:'idle'};$('previewState').textContent=p.status;$('previewState').className=p.status==='live'?'ok':p.status==='error'?'bad':'unknown';$('previewNote').textContent=p.error||({idle:'Preview muncul setelah receiver dijalankan.',waiting:'Menunggu frame H.264 dari HP...',live:'LIVE - H.264 -> MJPEG',stopped:'Run selesai - menampilkan frame terakhir'}[p.status]||p.status);const live=['starting','running'].includes(s.state);if(s.run_id&&live)$('runId').value=s.run_id;
+  async function pollSession(){try{const s=await api('/api/session');$('sessionState').textContent=s.state;$('sessionState').className=s.state==='complete'?'ok':s.state==='failed'?'bad':'unknown';$('console').textContent=(s.output||[]).join('\n')||'No active session.';$('console').scrollTop=$('console').scrollHeight;$('startBtn').disabled=['starting','running'].includes(s.state);$('stopBtn').disabled=!['starting','running'].includes(s.state);const p=s.preview||{status:'idle'};$('previewState').textContent=p.status;$('previewState').className=p.status==='live'?'ok':p.status==='error'?'bad':'unknown';$('previewNote').textContent=p.error||({idle:'Preview muncul setelah receiver dijalankan.',waiting:'Menunggu frame dari HP...',live:'LIVE',stopped:'Run selesai - menampilkan frame terakhir'}[p.status]||p.status);const live=['starting','running'].includes(s.state);if(s.run_id&&live)$('runId').value=s.run_id;
     // Follow the running receiver's own file. Selection by click is not
     // reliable here: a run can start without Start being pressed on this page,
     // and the history table only refreshes every 5 s, so it may not list the

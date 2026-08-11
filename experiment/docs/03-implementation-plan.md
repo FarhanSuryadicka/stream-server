@@ -10,7 +10,7 @@ to be measured; the "Status" column says exactly what exists.
 | # | Protocol | Sender (Android) | Receiver (PC) | Can produce numbers? |
 |---|---|---|---|---|
 | 4 | Raw UDP | ✅ implemented, compiled | ✅ implemented, tested E2E | ✅ **yes — ready to measure on-device** |
-| 5 | MJPEG/HTTP | ✅ implemented, compiled | ⛔ reader not written | ⚠️ partial |
+| 5 | MJPEG/HTTP | ✅ camera JPEG passthrough, compiled | ✅ HTTP multipart reader, compiled | ⚠️ needs on-device validation |
 | 2 | SRT | ⛔ stub | ⛔ | ❌ needs libsrt |
 | 3 | RTSP/RTP | ⛔ stub | ⛔ | ❌ needs RTP stack |
 | 1 | WebRTC | ⛔ stub | ⛔ | ❌ needs libdatachannel |
@@ -114,17 +114,19 @@ Remaining: nothing, beyond feeding it real encoded frames from §1.
 
 ## 3. MJPEG over HTTP — protocol #5
 
-**Status: sender done, receiver not written.** `ucv_transport_mjpeg.c`,
-compiled, symbol verified.
+**Status: implemented on both sides; on-device validation remains.** Android
+forwards the camera's JPEG bytes directly (no MediaCodec step), while the PC
+reader parses each multipart `Content-Length` body and its `X-UCV-*` timing
+headers. The dashboard can select `mjpeg`, graph the live run, and display the
+JPEG preview without FFmpeg.
 
 Instrumentation headers per `02-wire-format.md` §1.2, `TCP_NODELAY` set (Nagle
 would otherwise add tens of ms that belong to the socket option, not the
 protocol, and would unfairly penalise MJPEG).
 
-**Remaining work:** an HTTP multipart reader for the PC. It is a different
-shape from the datagram receiver (parse headers, read `Content-Length` bodies
-off a TCP stream), which is why `ucv-receiver` currently exits with a clear
-"not implemented" message rather than pretending. **~1 day.**
+**Remaining work:** validate a physical-camera run. For TCP, sequence gaps
+measure application-visible frame loss; IP retransmissions require a packet
+capture and cannot be inferred from HTTP.
 
 > Note for the results table: MJPEG will be measured carrying **JPEG**, not
 > H.264 — it has no inter-frame compression by definition. Its bandwidth

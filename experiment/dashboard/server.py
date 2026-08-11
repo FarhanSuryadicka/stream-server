@@ -44,6 +44,7 @@ SAFE_TEXT = re.compile(r"^[A-Za-z0-9_.@-]{1,96}$")
 GROUP_TEXT = re.compile(r"^[A-Za-z0-9 _.@:+/()x-]{1,64}$")
 MODE_TEXT = re.compile(r"^\d{2,5}x\d{2,5}@\d{1,3}$")
 PREVIEW_MAGIC = 0x31565055
+PREVIEW_JPEG_MAGIC = 0x314A5055
 PREVIEW_HEADER = struct.Struct("<IIIHH")
 CONTROL_PACKET = struct.Struct("<IBBHIQ8sI")
 ACK_PACKET = struct.Struct("<IBBHIQQQI")
@@ -140,7 +141,7 @@ def stop_phone_pipeline(phone: str, port: int = 8200) -> None:
 
 
 class PreviewPipeline:
-    """Best-effort H.264 -> JPEG preview, isolated from measurements."""
+    """Best-effort H.264/JPEG preview, isolated from measurements."""
 
     def __init__(self) -> None:
         self.condition = threading.Condition()
@@ -159,31 +160,34 @@ class PreviewPipeline:
         known = Path(r"C:\Tools\ffmpeg\bin\ffmpeg.exe")
         return str(known) if known.is_file() else None
 
-    def start(self) -> int:
+    def start(self, protocol: str) -> int:
         self.stop()
-        ffmpeg = self._find_ffmpeg()
-        if not ffmpeg:
-            raise ValueError("FFmpeg tidak ditemukan; install FFmpeg atau tambahkan ke PATH")
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.bind(("127.0.0.1", 0))
         udp.settimeout(0.5)
         port = int(udp.getsockname()[1])
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        command = [
-            ffmpeg, "-hide_banner", "-loglevel", "error",
-            "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-            "-f", "h264", "-i", "pipe:0", "-an",
-            "-vf", "scale='min(960,iw)':-2",
-            "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1",
-        ]
-        try:
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, creationflags=flags,
-            )
-        except OSError:
-            udp.close()
-            raise ValueError("FFmpeg gagal dijalankan")
+        process = None
+        if protocol == "raw_udp":
+            ffmpeg = self._find_ffmpeg()
+            if not ffmpeg:
+                udp.close()
+                raise ValueError("FFmpeg tidak ditemukan; install FFmpeg atau tambahkan ke PATH")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
+                "-f", "h264", "-i", "pipe:0", "-an",
+                "-vf", "scale='min(960,iw)':-2",
+                "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1",
+            ]
+            try:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, creationflags=flags,
+                )
+            except OSError:
+                udp.close()
+                raise ValueError("FFmpeg gagal dijalankan")
         self.sock = udp
         self.ffmpeg = process
         self.stop_event.clear()
@@ -193,8 +197,9 @@ class PreviewPipeline:
             self.status = "waiting"
             self.error = ""
             self.condition.notify_all()
-        threading.Thread(target=self._receive_h264, daemon=True).start()
-        threading.Thread(target=self._read_jpegs, daemon=True).start()
+        threading.Thread(target=self._receive_frames, daemon=True).start()
+        if process:
+            threading.Thread(target=self._read_jpegs, daemon=True).start()
         return port
 
     def stop(self) -> None:
@@ -223,9 +228,9 @@ class PreviewPipeline:
             self.error = message
             self.condition.notify_all()
 
-    def _receive_h264(self) -> None:
+    def _receive_frames(self) -> None:
         sock, process = self.sock, self.ffmpeg
-        if not sock or not process or not process.stdin:
+        if not sock:
             return
         pending: dict[int, dict] = {}
         while not self.stop_event.is_set():
@@ -240,7 +245,7 @@ class PreviewPipeline:
             if len(packet) < PREVIEW_HEADER.size:
                 continue
             magic, seq, frame_bytes, index, count = PREVIEW_HEADER.unpack_from(packet)
-            if magic != PREVIEW_MAGIC or not count or index >= count or frame_bytes > 32 * 1024 * 1024:
+            if magic not in (PREVIEW_MAGIC, PREVIEW_JPEG_MAGIC) or not count or index >= count or frame_bytes > 32 * 1024 * 1024:
                 continue
             item = pending.setdefault(seq, {
                 "size": frame_bytes, "count": count, "parts": {}, "at": time.monotonic(),
@@ -255,13 +260,22 @@ class PreviewPipeline:
             pending.pop(seq, None)
             if len(frame) != frame_bytes:
                 continue
-            try:
-                process.stdin.write(frame)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                if not self.stop_event.is_set():
-                    self._set_error("FFmpeg berhenti saat membaca H.264")
-                break
+            if magic == PREVIEW_JPEG_MAGIC:
+                if not (frame.startswith(b"\xff\xd8") and frame.endswith(b"\xff\xd9")):
+                    continue
+                with self.condition:
+                    self.latest_jpeg = frame
+                    self.frame_number += 1
+                    self.status = "live"
+                    self.condition.notify_all()
+            elif process and process.stdin:
+                try:
+                    process.stdin.write(frame)
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    if not self.stop_event.is_set():
+                        self._set_error("FFmpeg berhenti saat membaca H.264")
+                    break
 
     def _read_jpegs(self) -> None:
         process = self.ffmpeg
@@ -401,14 +415,14 @@ class DashboardState:
         duration = max(10, min(3600, int(request.get("duration", 60))))
         warmup = max(0, min(duration - 1, int(request.get("warmup", 5))))
         protocol = str(request.get("protocol", "raw_udp"))
-        if protocol != "raw_udp":
-            raise ValueError("only raw_udp is implemented")
+        if protocol not in ("raw_udp", "mjpeg"):
+            raise ValueError("protocol belum diimplementasikan")
 
         with self.lock:
             if self.process and self.process.poll() is None:
                 raise ValueError("a receiver session is already running")
 
-            preview_port = self.preview.start()
+            preview_port = self.preview.start(protocol)
             command = [
                 str(RECEIVER_EXE), "--phone", phone,
                 "--protocol", protocol,

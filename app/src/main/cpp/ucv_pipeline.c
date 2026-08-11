@@ -84,6 +84,7 @@ static uvc_stream_handle_t *g_strmh = NULL;
 static ucv_encoder_t   *g_enc = NULL;
 static ucv_jpeg_decoder_t *g_dec = NULL;
 static ucv_transport_t *g_tx = NULL;
+static int              g_direct_mjpeg = 0;
 
 static ucv_pipeline_stats_t g_stats;
 static pthread_mutex_t      g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -99,6 +100,56 @@ static uint64_t now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* MJPEG/HTTP carries the JPEG produced by the UVC camera byte-for-byte. */
+static void *mjpeg_capture_thread(void *arg) {
+  (void)arg;
+  PLOG("pipeline: MJPEG passthrough capture thread started");
+  uint64_t capture_misses = 0;
+  while (!g_quit) {
+    uvc_frame_t *fr = NULL;
+    uvc_error_t res = uvc_stream_get_frame(g_strmh, &fr, 1000000);
+    if (res != UVC_SUCCESS || !fr || !fr->data || !fr->data_bytes) {
+      capture_misses++;
+      if (capture_misses == 1 || capture_misses == 5 || capture_misses % 10 == 0)
+        PLOGE("pipeline: MJPEG capture wait failed res=%d misses=%llu",
+              (int)res, (unsigned long long)capture_misses);
+      continue;
+    }
+    capture_misses = 0;
+    const uint64_t t_cap = now_ns();
+    pthread_mutex_lock(&g_stats_lock);
+    g_stats.frames_captured++;
+    const uint64_t captured = g_stats.frames_captured;
+    pthread_mutex_unlock(&g_stats_lock);
+    if (captured == 1)
+      PLOG("pipeline: FIRST MJPEG FRAME CAPTURED (%zu bytes)", fr->data_bytes);
+
+    ucv_encoded_frame_t f;
+    f.data = (const uint8_t *)fr->data;
+    f.size = fr->data_bytes;
+    f.seq = g_send_seq;
+    f.t_capture_ns = t_cap;
+    f.t_encoded_ns = t_cap; /* camera JPEG; no phone-side encode */
+    f.is_keyframe = 1;
+    const int sr = g_tx->send(g_tx, &f);
+
+    pthread_mutex_lock(&g_stats_lock);
+    if (sr == 0) {
+      if (g_stats.frames_sent == 0)
+        PLOG("pipeline: FIRST MJPEG FRAME SENT (%zu bytes)", fr->data_bytes);
+      g_stats.frames_sent++;
+      g_stats.bytes_payload += fr->data_bytes;
+      g_send_seq++;
+    } else if (sr != -ENOTCONN) {
+      g_stats.send_errors++;
+    }
+    g_stats.bytes_wire = g_tx->bytes_wire;
+    pthread_mutex_unlock(&g_stats_lock);
+  }
+  PLOG("pipeline: MJPEG passthrough capture thread exiting");
+  return NULL;
 }
 
 /* ---------------------------------------------------------------- */
@@ -293,6 +344,12 @@ int ucv_pipeline_start(void *strmh, ucv_protocol_t proto, const char *peer_cfg,
     return -ENOSYS;
   }
 
+  g_direct_mjpeg = proto == UCV_PROTO_MJPEG;
+  if (g_direct_mjpeg) {
+    snprintf(g_enc_desc, sizeof(g_enc_desc),
+             "camera MJPEG passthrough %dx%d@%d (no phone re-encode)",
+             width, height, fps);
+  } else {
   g_dec = ucv_jpeg_decoder_create(width, height);
   if (!g_dec) {
     PLOGE("pipeline: jpeg decoder init failed (%dx%d)", width, height);
@@ -325,6 +382,7 @@ int ucv_pipeline_start(void *strmh, ucv_protocol_t proto, const char *peer_cfg,
            info.hardware_accelerated == 1
                ? "yes"
                : (info.hardware_accelerated == 0 ? "NO" : "undetermined"));
+  }
 
   /* Echo the peer back: a typo in the PC address produces a run where the
    * receiver simply waits and no frames arrive, with no error on either
@@ -335,10 +393,8 @@ int ucv_pipeline_start(void *strmh, ucv_protocol_t proto, const char *peer_cfg,
   int rc = g_tx->start(g_tx, peer_cfg);
   if (rc != 0) {
     PLOGE("pipeline: transport '%s' start failed: %d", g_tx->name, rc);
-    ucv_encoder_destroy(g_enc);
-    g_enc = NULL;
-    ucv_jpeg_decoder_destroy(g_dec);
-    g_dec = NULL;
+    if (g_enc) { ucv_encoder_destroy(g_enc); g_enc = NULL; }
+    if (g_dec) { ucv_jpeg_decoder_destroy(g_dec); g_dec = NULL; }
     return rc;
   }
 
@@ -351,16 +407,17 @@ int ucv_pipeline_start(void *strmh, ucv_protocol_t proto, const char *peer_cfg,
   g_strmh = (uvc_stream_handle_t *)strmh;
   g_quit = 0;
 
-  if (pthread_create(&g_cap_th, NULL, capture_thread, NULL) != 0) {
+  if (pthread_create(&g_cap_th, NULL,
+                     g_direct_mjpeg ? mjpeg_capture_thread : capture_thread,
+                     NULL) != 0) {
     g_quit = 1;
     g_tx->stop(g_tx);
-    ucv_encoder_destroy(g_enc);
-    g_enc = NULL;
-    ucv_jpeg_decoder_destroy(g_dec);
-    g_dec = NULL;
+    if (g_enc) { ucv_encoder_destroy(g_enc); g_enc = NULL; }
+    if (g_dec) { ucv_jpeg_decoder_destroy(g_dec); g_dec = NULL; }
     return -EAGAIN;
   }
-  if (pthread_create(&g_drain_th, NULL, drain_thread, NULL) != 0) {
+  if (!g_direct_mjpeg &&
+      pthread_create(&g_drain_th, NULL, drain_thread, NULL) != 0) {
     g_quit = 1;
     pthread_join(g_cap_th, NULL);
     g_tx->stop(g_tx);
@@ -381,7 +438,8 @@ void ucv_pipeline_stop(void) {
     return;
   g_quit = 1;
   pthread_join(g_cap_th, NULL);
-  pthread_join(g_drain_th, NULL);
+  if (!g_direct_mjpeg)
+    pthread_join(g_drain_th, NULL);
 
   if (g_tx)
     g_tx->stop(g_tx);
@@ -395,6 +453,7 @@ void ucv_pipeline_stop(void) {
   }
   g_strmh = NULL;
   g_running = 0;
+  g_direct_mjpeg = 0;
 
   PLOG("pipeline: stopped (cap=%llu dec=%llu enc=%llu sent=%llu "
        "decerr=%llu drop=%llu senderr=%llu)",

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,7 +66,7 @@ void PrintUsage(const char* argv0) {
       "  --out <dir>           Log directory   (default: .)\n"
       "  --mode <WxH@fps>      Capture mode metadata (default: unknown)\n"
       "  --condition <name>    Network condition label (default: unspecified)\n"
-      "  --preview-port <n>    Mirror H.264 frames to localhost dashboard\n"
+      "  --preview-port <n>    Mirror frames to localhost dashboard\n"
       "  --manual-phone        Do not remotely start/stop the phone pipeline\n"
       "  --no-control-load     Do not send control commands during the run\n"
       "  --control-hz <n>      Control command rate (default: 10)\n"
@@ -131,6 +132,7 @@ struct PreviewHeader {
 #pragma pack(pop)
 
 constexpr uint32_t kPreviewMagic = 0x31565055;  // "UPV1" in little endian
+constexpr uint32_t kPreviewJpegMagic = 0x314A5055;  // "UPJ1"
 constexpr size_t kPreviewChunk = 60000;
 
 // ---------------------------------------------------------------------
@@ -150,6 +152,8 @@ class Reassembler {
     uint64_t t_recv_ns;   // when the last fragment landed
     uint32_t bytes;
     bool     keyframe;
+    uint32_t run_hash = 0;
+    uint32_t wire_bytes = 0;
     std::vector<uint8_t> payload;
   };
 
@@ -221,7 +225,8 @@ class Reassembler {
   std::vector<uint8_t> payload_;
 };
 
-void SendPreviewFrame(ucv::UdpSender* sender, const Reassembler::Complete& frame) {
+void SendPreviewFrame(ucv::UdpSender* sender, const Reassembler::Complete& frame,
+                      bool jpeg) {
   if (!sender || frame.payload.empty()) return;
   const size_t count = (frame.payload.size() + kPreviewChunk - 1) / kPreviewChunk;
   if (count == 0 || count > 65535) return;
@@ -229,7 +234,7 @@ void SendPreviewFrame(ucv::UdpSender* sender, const Reassembler::Complete& frame
   for (size_t i = 0; i < count; ++i) {
     const size_t offset = i * kPreviewChunk;
     const size_t bytes = std::min(kPreviewChunk, frame.payload.size() - offset);
-    PreviewHeader h{kPreviewMagic, frame.seq,
+    PreviewHeader h{jpeg ? kPreviewJpegMagic : kPreviewMagic, frame.seq,
                     static_cast<uint32_t>(frame.payload.size()),
                     static_cast<uint16_t>(i), static_cast<uint16_t>(count)};
     std::memcpy(packet.data(), &h, sizeof(h));
@@ -237,6 +242,92 @@ void SendPreviewFrame(ucv::UdpSender* sender, const Reassembler::Complete& frame
     if (!sender->Send(packet.data(), sizeof(h) + bytes)) break;
   }
 }
+
+class MjpegReader {
+ public:
+  bool Connect(const std::string& phone, int port) {
+    if (!tcp_.Connect(phone, port, 1000)) return false;
+    static const char request[] =
+        "GET / HTTP/1.1\r\nHost: phone\r\nConnection: close\r\n\r\n";
+    return tcp_.SendAll(request, sizeof(request) - 1);
+  }
+
+  int ReadFrame(Reassembler::Complete* out, int timeout_ms) {
+    for (;;) {
+      if (!response_done_) {
+        const size_t end = buffer_.find("\r\n\r\n");
+        if (end != std::string::npos) {
+          if (buffer_.compare(0, 12, "HTTP/1.1 200") != 0) return -1;
+          buffer_.erase(0, end + 4);
+          response_done_ = true;
+        }
+      } else {
+        const size_t boundary = buffer_.find("--frame\r\n");
+        if (boundary != std::string::npos) {
+          if (boundary) buffer_.erase(0, boundary);
+          const size_t headers_end = buffer_.find("\r\n\r\n", 9);
+          if (headers_end != std::string::npos) {
+            const std::string headers = buffer_.substr(9, headers_end - 9);
+            uint64_t length = 0, seq = 0, cap = 0, enc = 0, snd = 0;
+            uint64_t key = 0, run = 0;
+            if (!HeaderNumber(headers, "Content-Length", &length) ||
+                !HeaderNumber(headers, "X-UCV-Seq", &seq) ||
+                !HeaderNumber(headers, "X-UCV-Cap-Ns", &cap) ||
+                !HeaderNumber(headers, "X-UCV-Enc-Ns", &enc) ||
+                !HeaderNumber(headers, "X-UCV-Snd-Ns", &snd) ||
+                !HeaderNumber(headers, "X-UCV-Key", &key) ||
+                !HeaderNumber(headers, "X-UCV-Run", &run) ||
+                length == 0 || length > 32 * 1024 * 1024) return -1;
+            const size_t body = headers_end + 4;
+            const size_t total = body + static_cast<size_t>(length) + 2;
+            if (buffer_.size() >= total) {
+              out->seq = static_cast<uint32_t>(seq);
+              out->t_capture_ns = cap;
+              out->t_encoded_ns = enc;
+              out->t_sent_ns = snd;
+              out->t_recv_ns = ucv::NowNs();
+              out->bytes = static_cast<uint32_t>(length);
+              out->keyframe = key != 0;
+              out->run_hash = static_cast<uint32_t>(run);
+              out->wire_bytes = static_cast<uint32_t>(total);
+              out->payload.assign(buffer_.begin() + body,
+                                  buffer_.begin() + body + length);
+              buffer_.erase(0, total);
+              return 1;
+            }
+          }
+        } else if (buffer_.size() > 1024) {
+          buffer_.erase(0, buffer_.size() - 8);
+        }
+      }
+      char chunk[64 * 1024];
+      const int n = tcp_.RecvTimeout(chunk, sizeof(chunk), timeout_ms);
+      if (n <= 0) return n;
+      buffer_.append(chunk, static_cast<size_t>(n));
+    }
+  }
+
+ private:
+  static bool HeaderNumber(const std::string& headers, const char* name,
+                           uint64_t* value) {
+    const std::string needle = std::string(name) + ":";
+    size_t pos = headers.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < headers.size() && headers[pos] == ' ') pos++;
+    const size_t end = headers.find("\r\n", pos);
+    try {
+      *value = std::stoull(headers.substr(pos, end - pos));
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  ucv::TcpClient tcp_;
+  std::string buffer_;
+  bool response_done_ = false;
+};
 
 }  // namespace
 
@@ -300,6 +391,7 @@ int main(int argc, char** argv) {
 
   ucv::UdpSocket video;
   ucv::UdpSender preview;
+  MjpegReader mjpeg;
   if (opt.protocol == "raw_udp") {
     if (!video.Bind(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot bind UDP :%d\n", opt.video_port);
@@ -314,6 +406,12 @@ int main(int argc, char** argv) {
       opt.preview_port = 0;
     }
   } else if (opt.protocol == "mjpeg") {
+    if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
+      std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
+                   opt.preview_port);
+      opt.preview_port = 0;
+    }
+  } else if (false) {
     std::fprintf(stderr,
                  "error: the mjpeg receiver is a separate reader (HTTP\n"
                  "       multipart, not datagrams). Not yet implemented in\n"
@@ -333,9 +431,11 @@ int main(int argc, char** argv) {
                    "fatal: remote phone control needs --mode WxH@fps\n");
       return 2;
     }
+    const uint8_t protocol_id = opt.protocol == "mjpeg"
+        ? UCV_PROTO_MJPEG : UCV_PROTO_RAWUDP;
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
-                                UCV_PROTO_RAWUDP, opt.video_port)) {
+                                protocol_id, opt.video_port)) {
       std::fprintf(stderr,
                    "fatal: phone rejected remote START for %s; refresh camera "
                    "modes and check the phone log\n",
@@ -344,6 +444,22 @@ int main(int argc, char** argv) {
     }
     std::printf("[phone] pipeline started remotely: %s -> this PC:%d\n",
                 opt.mode.c_str(), opt.video_port);
+  }
+
+  if (opt.protocol == "mjpeg") {
+    bool connected = false;
+    for (int attempt = 0; attempt < 30 && !connected; ++attempt) {
+      connected = mjpeg.Connect(opt.phone_ip, opt.video_port);
+      if (!connected)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!connected) {
+      std::fprintf(stderr, "fatal: cannot connect to MJPEG HTTP %s:%d\n",
+                   opt.phone_ip.c_str(), opt.video_port);
+      if (opt.remote_phone) control.StopRemoteRun();
+      return 2;
+    }
+    std::printf("[recv] connected to MJPEG HTTP stream\n");
   }
 
   // ------------------------------------------------------------------
@@ -394,6 +510,46 @@ int main(int argc, char** argv) {
   auto     last_report = t_start;
 
   while (!g_quit && std::chrono::steady_clock::now() < t_end) {
+    if (opt.protocol == "mjpeg") {
+      Reassembler::Complete f;
+      const int result = mjpeg.ReadFrame(&f, 200);
+      if (result == 0) continue;
+      if (result < 0) {
+        std::fprintf(stderr, "warning: MJPEG stream ended\n");
+        break;
+      }
+      if (f.run_hash != expected_run_hash) { wrong_run++; continue; }
+      bytes_wire += f.wire_bytes;
+      if (opt.preview_port) SendPreviewFrame(&preview, f, true);
+      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!seq.Observe(f.seq)) continue;
+
+      const double transport = (static_cast<int64_t>(f.t_recv_ns) +
+                                sync_before.offset_ns -
+                                static_cast<int64_t>(f.t_sent_ns)) / 1e6;
+      const double glass = (static_cast<int64_t>(f.t_recv_ns) +
+                            sync_before.offset_ns -
+                            static_cast<int64_t>(f.t_capture_ns)) / 1e6;
+      transport_ms.Add(transport);
+      glass_ms.Add(glass);
+      encode_ms.Add(0.0);
+      jitter.Update(static_cast<int64_t>(f.t_sent_ns),
+                    static_cast<int64_t>(f.t_recv_ns));
+      bytes_payload += f.bytes;
+      frames_in_window++;
+      log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
+                     f.t_recv_ns, f.bytes, true);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_report >= std::chrono::seconds(5)) {
+        std::printf("[recv] %6llu MJPEG frames  transport p50=%.1f ms  jitter=%.2f ms  gaps=%llu\n",
+                    static_cast<unsigned long long>(frames_in_window),
+                    transport_ms.Percentile(0.50), jitter.jitter_ms(),
+                    static_cast<unsigned long long>(seq.gap_frames()));
+        last_report = now;
+      }
+      continue;
+    }
+
     int n = video.RecvTimeout(buf.data(), buf.size(), 200);
     if (n <= 0) continue;
 
@@ -418,7 +574,7 @@ int main(int argc, char** argv) {
 
     // Preview sees the initial SPS/PPS-bearing keyframe even though warmup
     // frames are intentionally excluded from all measurements below.
-    if (opt.preview_port) SendPreviewFrame(&preview, f);
+    if (opt.preview_port) SendPreviewFrame(&preview, f, false);
 
     const bool in_window = std::chrono::steady_clock::now() >= t_warmup;
     if (!in_window) continue;   // discard encoder ramp-up / handshake

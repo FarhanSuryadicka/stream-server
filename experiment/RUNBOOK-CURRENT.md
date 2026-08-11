@@ -288,8 +288,9 @@ melalui raw USB host. Izin tersebut tetap harus diberikan.
 Di website:
 
 1. pastikan Phone IP adalah `192.168.137.139`;
-2. tekan **Refresh camera modes**;
-3. pilih **MJPEG resolution**.
+2. pilih **Raw UDP (H.264)** atau **MJPEG over HTTP** pada Protocol;
+3. tekan **Refresh camera modes**;
+4. pilih **MJPEG resolution**.
 
 Daftar resolusi dan FPS diambil langsung dari descriptor MJPEG kamera. YUYV/YUV
 tidak ikut. Website hanya menampilkan resolusinya; FPS dipilih otomatis sebagai
@@ -323,7 +324,7 @@ run ID yang berbeda.
 
 ### Langkah 5 — Start
 
-Tekan **Start measurement** satu kali. Urutan otomatisnya:
+Tekan **Start measurement** satu kali. Untuk Raw UDP urutannya:
 
 ```text
 clock sync PC <-> HP
@@ -337,6 +338,10 @@ clock sync PC <-> HP
 ```
 
 Tidak perlu menekan Start Control atau Start Raw UDP di HP.
+
+Untuk **MJPEG over HTTP**, HP tidak melakukan decode atau re-encode. Kamera
+UVC menghasilkan JPEG yang langsung dikirim sebagai HTTP multipart pada port
+8181. Header `X-UCV-*` membawa sequence dan timestamp setiap frame.
 
 Console sehat menampilkan:
 
@@ -447,6 +452,8 @@ localhost. FFmpeg mengubahnya menjadi MJPEG untuk endpoint:
 ```
 
 Preview tidak mengambil paket langsung dari HP dan tidak berebut port receiver.
+Pada protocol MJPEG, receiver meneruskan salinan JPEG langsung ke dashboard;
+FFmpeg hanya digunakan untuk preview Raw UDP/H.264.
 
 ## 11. File hasil
 
@@ -631,4 +638,3 @@ Status verifikasi terakhir:
 - preview H.264 -> FFmpeg -> MJPEG telah diuji;
 - streaming nyata pernah berhasil dengan frame, latency, jitter, goodput, dan
   zero sequence gaps tercatat.
-

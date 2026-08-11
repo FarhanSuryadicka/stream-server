@@ -72,6 +72,18 @@ class UdpSender {
   int peer_port_ = 0;
 };
 
+class TcpClient {
+ public:
+  ~TcpClient();
+  bool Connect(const std::string& peer_ip, int port, int timeout_ms);
+  bool SendAll(const void* data, size_t len);
+  int RecvTimeout(void* buf, size_t len, int timeout_ms);
+  void Close();
+
+ private:
+  SocketHandle fd_ = kInvalidSocket;
+};
+
 // Result of the SNTP-style exchange in harness spec §4.1.
 struct ClockSync {
   int64_t offset_ns   = 0;  // phone_clock - pc_clock
