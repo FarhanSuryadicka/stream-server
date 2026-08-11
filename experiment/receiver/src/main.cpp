@@ -18,6 +18,7 @@
 #include "ucv_stats.h"
 #include "ucv_net.h"
 #include "ucv_log.h"
+#include "ucv_rtsp.h"
 #include <srt.h>
 #include <rtc/rtc.hpp>
 
@@ -44,6 +45,7 @@ struct Options {
   std::string protocol   = "raw_udp";
   std::string phone_ip;
   int         video_port   = UCV_PORT_RAWUDP;
+  int         rtsp_port    = UCV_PORT_RTSP;
   int         control_port = UCV_PORT_CONTROL;
   int         duration_s   = 120;
   int         warmup_s     = 10;
@@ -66,12 +68,13 @@ void PrintUsage(const char* argv0) {
       "  --phone <ip>          Phone IP address (required)\n"
       "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg |\n"
       "                        hls | rtmp | webrtc   (default: raw_udp)\n"
-      "                        rtsp receives the same RTP packets as rtp_udp;\n"
-      "                        only the sender differs, so the run records\n"
-      "                        which one was used. hls polls the phone's\n"
+      "                        rtsp performs OPTIONS/DESCRIBE/SETUP/PLAY, then\n"
+      "                        receives the same RTP packets as rtp_udp. hls\n"
+      "                        polls the phone's\n"
       "                        playlist over HTTP. rtmp LISTENS: the phone\n"
       "                        publishes to us (plaintext, not rtmps).\n"
-      "  --video-port <n>      Video port      (default: protocol default)\n"
+      "  --video-port <n>      Video/media port (default: protocol default)\n"
+      "  --rtsp-port <n>       RTSP signalling port (default: %d)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
       "  --warmup <s>          Discarded head  (default: 10)\n"
@@ -86,7 +89,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "Control RTT is measured WHILE video streams, because measuring it on\n"
       "an idle link produces a best case that does not exist in deployment.\n",
-      argv0, UCV_PORT_CONTROL);
+      argv0, UCV_PORT_RTSP, UCV_PORT_CONTROL);
 }
 
 bool ParseArgs(int argc, char** argv, Options* o) {
@@ -103,6 +106,7 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     else if (a == "--phone")        { auto v = next("--phone");        if (!v) return false; o->phone_ip = v; }
     else if (a == "--protocol")     { auto v = next("--protocol");     if (!v) return false; o->protocol = v; }
     else if (a == "--video-port")   { auto v = next("--video-port");   if (!v) return false; o->video_port = std::atoi(v); }
+    else if (a == "--rtsp-port")    { auto v = next("--rtsp-port");    if (!v) return false; o->rtsp_port = std::atoi(v); }
     else if (a == "--control-port") { auto v = next("--control-port"); if (!v) return false; o->control_port = std::atoi(v); }
     else if (a == "--duration")     { auto v = next("--duration");     if (!v) return false; o->duration_s = std::atoi(v); }
     else if (a == "--warmup")       { auto v = next("--warmup");       if (!v) return false; o->warmup_s = std::atoi(v); }
@@ -147,6 +151,11 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     o->video_port = UCV_PORT_SIGNAL;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
+    return false;
+  }
+  if (o->video_port <= 0 || o->video_port > 65535 ||
+      o->rtsp_port <= 0 || o->rtsp_port > 65535) {
+    std::fprintf(stderr, "error: invalid video/RTSP port\n");
     return false;
   }
   return true;
@@ -1278,6 +1287,7 @@ int main(int argc, char** argv) {
   RtmpReader rtmp;
   WebrtcReader webrtc;
   SrtReceiver srt;
+  ucv::RtspClient rtsp_client;
   if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
       opt.protocol == "rtsp") {
     if (!video.Bind(opt.video_port)) {
@@ -1355,26 +1365,52 @@ int main(int argc, char** argv) {
       return 2;
     }
     const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
-        (rtp_wire ? UCV_PROTO_RTSP :
+        (opt.protocol == "rtsp" ? UCV_PROTO_RTSP_SIGNALLED :
+         (opt.protocol == "rtp_udp" ? UCV_PROTO_RTSP :
          (opt.protocol == "srt" ? UCV_PROTO_SRT :
           (opt.protocol == "hls" ? UCV_PROTO_HLS :
            (opt.protocol == "rtmp" ? UCV_PROTO_RTMPS :
-            (opt.protocol == "webrtc" ? UCV_PROTO_WEBRTC
-                                      : UCV_PROTO_RAWUDP)))));
+             (opt.protocol == "webrtc" ? UCV_PROTO_WEBRTC
+                                       : UCV_PROTO_RAWUDP))))));
+    const int remote_video_port =
+        opt.protocol == "rtsp" ? opt.rtsp_port : opt.video_port;
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
-                                protocol_id, opt.video_port)) {
+                                protocol_id, remote_video_port)) {
       std::fprintf(stderr,
                    "fatal: phone rejected remote START for %s; refresh camera "
                    "modes and check the phone log\n",
                    opt.mode.c_str());
       return 2;
     }
-    std::printf("[phone] pipeline started remotely: %s -> this PC:%d\n",
-                opt.mode.c_str(), opt.video_port);
+    if (opt.protocol == "rtsp") {
+      std::printf("[phone] RTSP server started remotely: %s on :%d "
+                  "(RTP media to this PC:%d)\n",
+                  opt.mode.c_str(), opt.rtsp_port, opt.video_port);
+    } else {
+      std::printf("[phone] pipeline started remotely: %s -> this PC:%d\n",
+                  opt.mode.c_str(), opt.video_port);
+    }
   }
 
-  if (opt.protocol == "mjpeg") {
+  if (opt.protocol == "rtsp") {
+    bool connected = false;
+    for (int attempt = 0; attempt < 30 && !connected; ++attempt) {
+      connected = rtsp_client.Start(opt.phone_ip, opt.rtsp_port,
+                                    opt.video_port, 3000);
+      if (!connected)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!connected) {
+      std::fprintf(stderr, "fatal: RTSP setup failed at rtsp://%s:%d/ucv: %s\n",
+                   opt.phone_ip.c_str(), opt.rtsp_port,
+                   rtsp_client.last_error().c_str());
+      if (opt.remote_phone) control.StopRemoteRun();
+      return 2;
+    }
+    std::printf("[recv] RTSP PLAY active (session=%s, RTP/UDP :%d)\n",
+                rtsp_client.session().c_str(), opt.video_port);
+  } else if (opt.protocol == "mjpeg") {
     bool connected = false;
     for (int attempt = 0; attempt < 30 && !connected; ++attempt) {
       connected = mjpeg.Connect(opt.phone_ip, opt.video_port);
@@ -1767,6 +1803,8 @@ int main(int argc, char** argv) {
 
   g_quit = true;
   if (control_thread.joinable()) control_thread.join();
+  if (opt.protocol == "rtsp" && !rtsp_client.Teardown())
+    std::fprintf(stderr, "warning: RTSP TEARDOWN was not acknowledged\n");
   if (opt.remote_phone) {
     if (control.StopRemoteRun())
       std::printf("[phone] pipeline stopped remotely\n");

@@ -9,9 +9,12 @@
 #include "ucv_wire.h"
 #include "ucv_stats.h"
 #include "ucv_remote_start.h"
+#include "ucv_rtsp.h"
 
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 static int g_failures = 0;
 
@@ -244,8 +247,8 @@ static void TestRemoteStartRouting() {
   CHECK(ucv_remote_start_supported(UCV_PROTO_HLS), "HLS remote START enabled");
   CHECK(ucv_remote_start_supported(UCV_PROTO_RTMPS), "RTMP remote START enabled");
   CHECK(ucv_remote_start_supported(UCV_PROTO_WEBRTC), "WebRTC remote START enabled");
-  CHECK(!ucv_remote_start_supported(UCV_PROTO_RTSP_SIGNALLED),
-        "signalled RTSP stays disabled until the receiver performs SETUP/PLAY");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_RTSP_SIGNALLED),
+        "signalled RTSP remote START enabled");
   CHECK(!ucv_remote_start_supported(999), "unknown protocol rejected");
 
   CHECK(ucv_remote_default_port(UCV_PROTO_RAWUDP) == UCV_PORT_RAWUDP,
@@ -271,6 +274,121 @@ static void TestRemoteStartRouting() {
         "HLS accepts the common peer:port configuration");
 }
 
+static void TestRtspResponseParsing() {
+  std::printf("\n[rtsp] response framing and case-insensitive headers\n");
+  const std::string sdp =
+      "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n";
+  const std::string raw =
+      "RTSP/1.0 200 OK\r\n"
+      "cseq: 3\r\n"
+      "Session: A1B2C3D4;timeout=60\r\n"
+      "Content-Length: " + std::to_string(sdp.size()) +
+      "\r\nContent-Type: application/sdp\r\n\r\n" + sdp;
+  ucv::RtspResponse response;
+  CHECK(ucv::ParseRtspResponse(raw, &response), "complete response parsed");
+  CHECK(response.status_code == 200, "status code parsed");
+  CHECK(response.cseq == 3, "CSeq parsed case-insensitively");
+  CHECK(response.Header("session") == "A1B2C3D4;timeout=60",
+        "Session header parsed case-insensitively");
+  CHECK(response.body == sdp, "Content-Length body preserved exactly");
+
+  const std::string truncated = raw.substr(0, raw.size() - 1);
+  CHECK(!ucv::ParseRtspResponse(truncated, &response),
+        "truncated SDP body rejected");
+  CHECK(!ucv::ParseRtspResponse("HTTP/1.1 200 OK\r\nCSeq: 1\r\n\r\n",
+                                &response),
+        "non-RTSP status line rejected");
+}
+
+static void TestRtspClientSession() {
+  std::printf("\n[rtsp] OPTIONS -> DESCRIBE -> SETUP -> PLAY -> TEARDOWN\n");
+  CHECK(ucv::NetInit(), "network runtime initialised");
+
+  ucv::TcpServer server;
+  int port = 0;
+  for (int candidate = 38554; candidate < 38564 && !port; candidate++) {
+    if (server.Listen(candidate)) port = candidate;
+  }
+  CHECK(port != 0, "mock RTSP server listening");
+  if (!port) {
+    ucv::NetShutdown();
+    return;
+  }
+
+  std::vector<std::string> requests;
+  bool server_ok = false;
+  std::thread server_thread([&] {
+    if (!server.AcceptTimeout(3000)) return;
+    const std::string sdp =
+        "v=0\r\n"
+        "m=video 5004 RTP/AVP 96\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=control:track0\r\n";
+    for (int index = 0; index < 5; index++) {
+      std::string request;
+      char buf[1024];
+      while (request.find("\r\n\r\n") == std::string::npos) {
+        const int n = server.RecvTimeout(buf, sizeof(buf), 1500);
+        if (n <= 0) return;
+        request.append(buf, static_cast<size_t>(n));
+        if (request.size() > 8192) return;
+      }
+      requests.push_back(request);
+
+      const int cseq = index + 1;
+      std::string extra;
+      std::string body;
+      if (index == 0) {
+        extra = "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n";
+      } else if (index == 1) {
+        extra = "Content-Type: application/sdp\r\n";
+        body = sdp;
+      } else if (index == 2) {
+        extra =
+            "Transport: RTP/AVP;unicast;client_port=35004-35005;"
+            "server_port=5004-5005\r\n"
+            "Session: ABCD1234;timeout=60\r\n";
+      } else {
+        extra = "Session: ABCD1234\r\n";
+      }
+      std::string response =
+          "RTSP/1.0 200 OK\r\nCSeq: " + std::to_string(cseq) + "\r\n" +
+          extra;
+      if (!body.empty())
+        response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+      response += "\r\n" + body;
+      if (!server.SendAll(response.data(), response.size())) return;
+    }
+    server_ok = true;
+  });
+
+  ucv::RtspClient client;
+  const bool started = client.Start("127.0.0.1", port, 35004, 2000);
+  const bool active = client.active();
+  const std::string session = client.session();
+  const bool torn_down = started && client.Teardown(2000);
+  server_thread.join();
+
+  CHECK(started, "RTSP client completed PLAY");
+  CHECK(active, "session marked active after PLAY");
+  CHECK(session == "ABCD1234", "Session timeout parameter stripped");
+  CHECK(torn_down, "TEARDOWN acknowledged");
+  CHECK(server_ok && requests.size() == 5, "all five RTSP methods observed");
+  if (requests.size() == 5) {
+    CHECK(requests[0].find("OPTIONS rtsp://") == 0, "OPTIONS sent first");
+    CHECK(requests[1].find("DESCRIBE rtsp://") == 0, "DESCRIBE sent second");
+    CHECK(requests[2].find("SETUP rtsp://") == 0, "SETUP sent third");
+    CHECK(requests[2].find("client_port=35004-35005") != std::string::npos,
+          "SETUP negotiates the bound RTP/RTCP ports");
+    CHECK(requests[3].find("PLAY rtsp://") == 0, "PLAY sent fourth");
+    CHECK(requests[3].find("Session: ABCD1234") != std::string::npos,
+          "PLAY carries negotiated Session");
+    CHECK(requests[4].find("TEARDOWN rtsp://") == 0, "TEARDOWN sent last");
+  }
+  server.Close();
+  ucv::NetShutdown();
+}
+
 int main() {
   std::printf("ucv measurement primitives — self test\n");
   std::printf("======================================\n");
@@ -283,6 +401,8 @@ int main() {
   TestJitter();
   TestRunIdHash();
   TestRemoteStartRouting();
+  TestRtspResponseParsing();
+  TestRtspClientSession();
 
   std::printf("\n======================================\n");
   if (g_failures == 0) {

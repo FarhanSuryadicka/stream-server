@@ -29,10 +29,8 @@ static inline int ucv_remote_start_supported(uint16_t protocol_id) {
     case UCV_PROTO_WEBRTC:
     case UCV_PROTO_RTMPS:
     case UCV_PROTO_HLS:
-      return 1;
-    /* The Android RTSP server exists, but the PC receiver does not yet perform
-     * an RTSP session. Reject it rather than producing a mislabeled run. */
     case UCV_PROTO_RTSP_SIGNALLED:
+      return 1;
     default:
       return 0;
   }

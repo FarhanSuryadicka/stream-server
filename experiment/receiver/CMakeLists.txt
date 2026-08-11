@@ -44,6 +44,7 @@ add_executable(ucv-receiver
     src/main.cpp
     src/ucv_net.cpp
     src/ucv_log.cpp
+    src/ucv_rtsp.cpp
 )
 target_include_directories(ucv-receiver PRIVATE
     ${SRT_SOURCE_DIR}/srtcore
@@ -57,7 +58,11 @@ target_link_libraries(ucv-receiver PRIVATE srt_static datachannel-static)
 # recovery, percentiles, loss/reorder accounting, and jitter's independence
 # from clock offset. Run it before trusting any measurement — a bug in these
 # does not crash, it silently produces plausible wrong numbers.
-add_executable(ucv-selftest src/selftest.cpp)
+add_executable(ucv-selftest
+    src/selftest.cpp
+    src/ucv_net.cpp
+    src/ucv_rtsp.cpp
+)
 target_include_directories(ucv-selftest PRIVATE ${UCV_CPP_DIR})
 
 # Phone stand-in that speaks the real wire protocol, so the whole measurement

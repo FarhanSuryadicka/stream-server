@@ -1,4 +1,4 @@
-/* RTSP signalling over the existing RTP/UDP data plane (protocol #3).
+/* RTSP signalling (protocol #8) over the existing RTP/UDP data plane (#3).
  *
  * The RTP packetiser in ucv_transport_rtp.c is already RFC 6184 compliant and
  * carries the measurement header in an RFC 8285 extension. What it lacked was
@@ -54,6 +54,7 @@ typedef struct {
   int  server_port;
   char session[24];
   char client_ip[48];
+  char server_ip[48];
   int  client_rtp_port;
   ucv_transport_t *rtp;   /* started once the client has issued PLAY */
   int rtp_started;
@@ -140,15 +141,15 @@ static void build_sdp(char *out, size_t out_n, const char *server_ip,
       "o=- 0 0 IN IP4 %s\r\n"
       "s=UCV Transport Lab\r\n"
       "i=UVC fisheye H.264, instrumented (RFC 8285 header extension)\r\n"
-      "c=IN IP4 0.0.0.0\r\n"
+      "c=IN IP4 %s\r\n"
       "t=0 0\r\n"
       "a=tool:ucv-transport-lab\r\n"
-      "a=recvonly\r\n"
+      "a=sendonly\r\n"
       "m=video %d RTP/AVP 96\r\n"
       "a=rtpmap:96 H264/90000\r\n"
       "a=fmtp:96 packetization-mode=1\r\n"
       "a=control:track0\r\n",
-      server_ip, rtp_port);
+      server_ip, server_ip, rtp_port);
 }
 
 /* Extracts client_port=NNNN from a Transport header. Returns 0 on success. */
@@ -182,11 +183,12 @@ static void handle_request(rtsp_impl_t *im, int sock, const char *req) {
 
   if (strcmp(method, "DESCRIBE") == 0) {
     char sdp[768];
-    build_sdp(sdp, sizeof(sdp), im->client_ip[0] ? im->client_ip : "0.0.0.0",
+    const char *server_ip = im->server_ip[0] ? im->server_ip : "0.0.0.0";
+    build_sdp(sdp, sizeof(sdp), server_ip,
               UCV_PORT_RTP);
     char extra[320];
-    snprintf(extra, sizeof(extra), "Content-Base: rtsp://0.0.0.0:%d/%s/\r\n",
-             im->server_port, RTSP_STREAM_PATH);
+    snprintf(extra, sizeof(extra), "Content-Base: rtsp://%s:%d/%s/\r\n",
+             server_ip, im->server_port, RTSP_STREAM_PATH);
     respond(sock, cseq, "200 OK", extra, sdp);
     SLOGI("rtsp: DESCRIBE -> SDP sent");
     return;
@@ -248,10 +250,8 @@ static void handle_request(rtsp_impl_t *im, int sock, const char *req) {
       return;
     }
     im->playing = 1;
-    char extra[160];
-    snprintf(extra, sizeof(extra),
-             "Session: %s\r\nRTP-Info: url=track0;seq=0;rtptime=0\r\n",
-             im->session);
+    char extra[80];
+    snprintf(extra, sizeof(extra), "Session: %s\r\n", im->session);
     respond(sock, cseq, "200 OK", extra, NULL);
     SLOGI("rtsp: PLAY -> RTP to %s", peer);
     return;
@@ -259,12 +259,14 @@ static void handle_request(rtsp_impl_t *im, int sock, const char *req) {
 
   if (strcmp(method, "TEARDOWN") == 0) {
     im->playing = 0;
+    char closed_session[sizeof(im->session)];
     pthread_mutex_lock(&im->lock);
+    snprintf(closed_session, sizeof(closed_session), "%s", im->session);
     if (im->rtp_started) { im->rtp->stop(im->rtp); im->rtp_started = 0; }
     im->session[0] = '\0';
     pthread_mutex_unlock(&im->lock);
     char extra[64];
-    snprintf(extra, sizeof(extra), "Session: %s\r\n", im->session);
+    snprintf(extra, sizeof(extra), "Session: %s\r\n", closed_session);
     respond(sock, cseq, "200 OK", extra, NULL);
     SLOGI("rtsp: TEARDOWN");
     return;
@@ -287,6 +289,10 @@ static void *rtsp_thread(void *arg) {
       continue;
     }
     inet_ntop(AF_INET, &peer.sin_addr, im->client_ip, sizeof(im->client_ip));
+    struct sockaddr_in local;
+    socklen_t local_len = sizeof(local);
+    if (getsockname(cs, (struct sockaddr *)&local, &local_len) == 0)
+      inet_ntop(AF_INET, &local.sin_addr, im->server_ip, sizeof(im->server_ip));
     im->client_sock = cs;
     SLOGI("rtsp: client %s connected", im->client_ip);
 
@@ -316,6 +322,7 @@ static void *rtsp_thread(void *arg) {
     im->playing = 0;
     pthread_mutex_lock(&im->lock);
     if (im->rtp_started) { im->rtp->stop(im->rtp); im->rtp_started = 0; }
+    im->session[0] = '\0';
     pthread_mutex_unlock(&im->lock);
     SLOGI("rtsp: client disconnected");
   }
@@ -368,6 +375,11 @@ static int rtsp_start(ucv_transport_t *self, const char *cfg) {
   im->playing = 0;
   im->rtp_started = 0;
   im->session[0] = '\0';
+  im->server_ip[0] = '\0';
+  im->rtp->frames_sent = 0;
+  im->rtp->bytes_payload = 0;
+  im->rtp->bytes_wire = 0;
+  im->rtp->send_errors = 0;
   if (pthread_create(&im->thread, NULL, rtsp_thread, im) != 0) {
     close(im->listen_sock); im->listen_sock = -1;
     return -EAGAIN;
@@ -412,7 +424,7 @@ static void rtsp_stop(ucv_transport_t *self) {
 }
 
 static ucv_transport_t g_rtsp = {
-    .name = "rtsp", .protocol_id = UCV_PROTO_RTSP,
+    .name = "rtsp", .protocol_id = UCV_PROTO_RTSP_SIGNALLED,
     .start = rtsp_start, .send = rtsp_send, .stop = rtsp_stop,
     .impl = &g_impl,
 };
