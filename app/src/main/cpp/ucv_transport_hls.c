@@ -284,8 +284,20 @@ static void seal_segment(hls_impl_t *im, uint64_t now_ns) {
     slot->frames = im->pending_frames;
     slot->duration_ms = (now_ns - im->segment_start_ns) / 1000000ull;
     if (!slot->duration_ms) slot->duration_ms = HLS_SEGMENT_MS;
-    memcpy(slot->meta, im->pending_meta, im->pending_meta_len);
-    slot->meta_len = im->pending_meta_len;
+    if (im->pending_meta_len) {
+      memcpy(slot->meta, im->pending_meta, im->pending_meta_len);
+      slot->meta_len = im->pending_meta_len;
+      /* pending_meta starts with "[\n" and contains comma-separated entries.
+       * Close it only when the segment is sealed so more frames can be
+       * appended without repeatedly removing a bracket. */
+      if (slot->meta_len + 3 <= sizeof(slot->meta)) {
+        memcpy(slot->meta + slot->meta_len, "\n]\n", 3);
+        slot->meta_len += 3;
+      }
+    } else {
+      memcpy(slot->meta, "[]\n", 3);
+      slot->meta_len = 3;
+    }
   }
   im->next_index++;
   if (im->next_index > HLS_WINDOW)
@@ -318,10 +330,18 @@ static void serve_playlist(hls_impl_t *im, int s) {
   size_t n = 0;
   pthread_mutex_lock(&im->lock);
   const uint32_t first = im->media_sequence;
+  uint64_t max_duration_ms = HLS_SEGMENT_MS;
+  for (uint32_t i = first; i < im->next_index; i++) {
+    const hls_segment_t *seg = &im->window[i % HLS_WINDOW];
+    if (seg->data && seg->index == i && seg->duration_ms > max_duration_ms)
+      max_duration_ms = seg->duration_ms;
+  }
+  const unsigned target_duration =
+      (unsigned)((max_duration_ms + 999) / 1000);
   n += (size_t)snprintf(body + n, sizeof(body) - n,
-      "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n"
+      "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%u\n"
       "#EXT-X-MEDIA-SEQUENCE:%u\n",
-      (HLS_SEGMENT_MS + 999) / 1000, first);
+      target_duration, first);
   for (uint32_t i = first; i < im->next_index && n < sizeof(body) - 96; i++) {
     const hls_segment_t *seg = &im->window[i % HLS_WINDOW];
     if (!seg->data || seg->index != i) continue;
@@ -469,6 +489,12 @@ static int hls_send(ucv_transport_t *self, const ucv_encoded_frame_t *f) {
   if (elapsed_ms >= HLS_SEGMENT_MS && f->is_keyframe && im->pending_size)
     seal_segment(im, now);
 
+  /* The first frame of every segment must be a random-access point. This also
+   * recovers cleanly after an oversized segment is discarded below. */
+  if (!im->pending_size && !f->is_keyframe)
+    return -ENOTCONN;
+
+  const size_t pending_before = im->pending_size;
   if (!im->pending_size) {
     if (write_pat(im) < 0 || write_pmt(im) < 0) {
       self->send_errors++;
@@ -498,22 +524,32 @@ static int hls_send(ucv_transport_t *self, const ucv_encoded_frame_t *f) {
   h.fragment_count = 1;
   h.t_sent_ns = ucv_now_ns();
   ucv_frame_header_finalize(&h);
-  if (im->pending_meta_len < sizeof(im->pending_meta) - 128) {
-    im->pending_meta_len += (size_t)snprintf(
-        im->pending_meta + im->pending_meta_len,
-        sizeof(im->pending_meta) - im->pending_meta_len,
+  if (im->pending_meta_len + 3 < sizeof(im->pending_meta)) {
+    /* Keep three bytes reserved for the closing "\n]\n" written by
+     * seal_segment(). snprintf() returns the size it wanted, so only advance
+     * the cursor when the complete record fit; otherwise a truncated record
+     * would make the sidecar invalid and could move the cursor past the array. */
+    const size_t available =
+        sizeof(im->pending_meta) - im->pending_meta_len - 3;
+    const int written = snprintf(
+        im->pending_meta + im->pending_meta_len, available,
         "%s{\"seq\":%u,\"cap\":%llu,\"enc\":%llu,\"snd\":%llu,"
         "\"bytes\":%u,\"key\":%s}",
         im->pending_meta_len ? ",\n" : "[\n",
         h.frame_seq, (unsigned long long)h.t_capture_ns,
         (unsigned long long)h.t_encoded_ns, (unsigned long long)h.t_sent_ns,
         (unsigned)f->size, f->is_keyframe ? "true" : "false");
+    if (written > 0 && (size_t)written < available)
+      im->pending_meta_len += (size_t)written;
   }
 
   im->pending_frames++;
   self->frames_sent++;
   self->bytes_payload += f->size;
-  self->bytes_wire += im->pending_size;
+  /* Count only TS bytes produced for this frame. Adding pending_size on every
+   * frame counts the beginning of the segment repeatedly and grows roughly
+   * quadratically with its frame count. */
+  self->bytes_wire += im->pending_size - pending_before;
   return 0;
 }
 

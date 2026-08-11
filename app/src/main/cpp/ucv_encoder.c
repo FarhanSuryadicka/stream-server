@@ -51,12 +51,11 @@ struct ucv_encoder {
   AMediaCodec *codec;
   ucv_encoder_info_t info;
 
-  /* SPS/PPS from BUFFER_FLAG_CODEC_CONFIG. Prepended to the first keyframe
-   * so a decoder joining the stream can start, and so the transport layer
-   * never has to know about codec config at all. */
+  /* SPS/PPS from BUFFER_FLAG_CODEC_CONFIG. Prepended to every keyframe so a
+   * late-joining receiver and every independently published HLS segment get a
+   * self-contained Annex-B random-access point. */
   uint8_t *csd;
   size_t   csd_size;
-  int      csd_sent;
 
   /* Output staging: AMediaCodec requires the output buffer be released
    * promptly, so the access unit is copied out before releasing rather than
@@ -315,10 +314,12 @@ int ucv_encoder_drain(ucv_encoder_t *e, const uint8_t **out_data,
     const int is_key =
         (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) ? 1 : 0;
 
-    /* Prepend SPS/PPS to the first keyframe so a receiver that joins mid
-     * stream can decode. Doing it here keeps every transport ignorant of
-     * codec config. */
-    const int prepend = (is_key && e->csd && !e->csd_sent) ? 1 : 0;
+    /* Repeat SPS/PPS at every random-access point. Sending it only once makes
+     * RTSP/WebRTC late join and HLS segments after the first dependent on bytes
+     * that are no longer available. Doing it here keeps all transports
+     * consistent and lets RTMP discard the in-band copies after building its
+     * AVC sequence header. */
+    const int prepend = (is_key && e->csd) ? 1 : 0;
     const size_t total =
         (size_t)info.size + (prepend ? e->csd_size : 0);
 
@@ -331,7 +332,6 @@ int ucv_encoder_drain(ucv_encoder_t *e, const uint8_t **out_data,
     if (prepend) {
       memcpy(e->out_buf, e->csd, e->csd_size);
       off = e->csd_size;
-      e->csd_sent = 1;
     }
     memcpy(e->out_buf + off, buf + info.offset, (size_t)info.size);
 
