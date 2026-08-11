@@ -8,7 +8,9 @@
 #ifndef UCV_RUN_LIST_MODEL_HPP
 #define UCV_RUN_LIST_MODEL_HPP
 
+#include "ucv/camera_modes.hpp"
 #include "ucv/metrics.hpp"
+#include "ucv/preview.hpp"
 #include "ucv/ndjson_reader.hpp"
 #include "ucv/receiver_process.hpp"
 
@@ -16,7 +18,10 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QMutex>
 #include <QTimer>
+#include <QImage>
+#include <QQuickImageProvider>
 #include <QVariantList>
 
 #include <filesystem>
@@ -108,6 +113,21 @@ class ComparisonModel : public QAbstractListModel {
   std::vector<Group> groups_;
 };
 
+// Serves the newest preview JPEG to QML. An image provider avoids a temp file
+// per frame — at 30 fps that would be 30 disk writes a second for a picture
+// that is already in memory.
+class PreviewImageProvider : public QQuickImageProvider {
+ public:
+  PreviewImageProvider() : QQuickImageProvider(QQuickImageProvider::Image) {}
+  QImage requestImage(const QString& id, QSize* size,
+                      const QSize& requested) override;
+  void setFrame(const QByteArray& jpeg);
+
+ private:
+  mutable QMutex lock_;
+  QByteArray jpeg_;
+};
+
 // Owns the session: starts and stops the receiver, polls the active log, and
 // exposes everything QML binds to.
 class MonitorController : public QObject {
@@ -122,6 +142,13 @@ class MonitorController : public QObject {
   Q_PROPERTY(QVariantMap selectedRun READ selectedRun NOTIFY selectionChanged)
   Q_PROPERTY(QVariantList series READ series NOTIFY selectionChanged)
   Q_PROPERTY(QStringList protocols READ protocols CONSTANT)
+  Q_PROPERTY(QString previewState READ previewState NOTIFY previewChanged)
+  Q_PROPERTY(QString previewNote READ previewNote NOTIFY previewChanged)
+  Q_PROPERTY(int previewFrame READ previewFrame NOTIFY previewChanged)
+  Q_PROPERTY(QStringList resolutionLabels READ resolutionLabels NOTIFY modesChanged)
+  Q_PROPERTY(QString modesStatus READ modesStatus NOTIFY modesChanged)
+  Q_PROPERTY(bool modesBusy READ modesBusy NOTIFY modesChanged)
+  Q_PROPERTY(QString selectedMode READ selectedMode NOTIFY modesChanged)
 
  public:
   explicit MonitorController(QObject* parent = nullptr);
@@ -137,6 +164,14 @@ class MonitorController : public QObject {
   QVariantMap selectedRun() const;
   QVariantList series() const;
   QStringList protocols() const;
+  QString previewState() const;
+  QString previewNote() const;
+  int previewFrame() const;
+  QStringList resolutionLabels() const;
+  QString modesStatus() const;
+  bool modesBusy() const { return modes_busy_; }
+  QString selectedMode() const;
+  PreviewImageProvider* previewProvider() { return preview_provider_; }
 
   RunListModel* runs() { return &runs_; }
   ComparisonModel* comparison() { return &comparison_; }
@@ -148,12 +183,16 @@ class MonitorController : public QObject {
   Q_INVOKABLE void selectRun(const QString& file);
   Q_INVOKABLE bool saveGroup(const QString& group);
   Q_INVOKABLE void refreshRuns();
+  Q_INVOKABLE void refreshCameraModes(const QString& phone);
+  Q_INVOKABLE void selectResolution(int index);
 
  signals:
   void sessionChanged();
   void selectionChanged();
   void pathsChanged();
   void errorRaised(const QString& message);
+  void previewChanged();
+  void modesChanged();
 
  private:
   void tick();
@@ -173,6 +212,15 @@ class MonitorController : public QObject {
   QString active_file_;
   std::optional<ucv::RunMetrics> selected_;
   bool pending_placeholder_ = false;
+
+  ucv::PreviewPipeline preview_;
+  PreviewImageProvider* preview_provider_ = nullptr;
+  int preview_frame_ = 0;
+
+  std::vector<ucv::CameraResolution> resolutions_;
+  int resolution_index_ = -1;
+  QString modes_status_;
+  bool modes_busy_ = false;
 };
 
 #endif  // UCV_RUN_LIST_MODEL_HPP

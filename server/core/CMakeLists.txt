@@ -9,9 +9,15 @@ add_library(ucv-core STATIC
     src/metrics.cpp
     src/ndjson_reader.cpp
     src/receiver_process.cpp
+    src/preview.cpp
+    src/camera_modes.cpp
 )
 
 target_include_directories(ucv-core PUBLIC include)
+# The wire contract is shared verbatim with the phone and the receiver;
+# a second copy could drift and break the control channel silently.
+target_include_directories(ucv-core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../experiment/receiver/include)
 
 if(MSVC)
   target_compile_options(ucv-core PRIVATE /W4)
@@ -21,6 +27,7 @@ else()
 endif()
 
 if(WIN32)
+  target_link_libraries(ucv-core PUBLIC ws2_32)
   # CreateProcess / GenerateConsoleCtrlEvent live in kernel32, which MinGW and
   # MSVC both link by default; nothing extra is needed here.
 else()

@@ -1,6 +1,10 @@
 #include "run_list_model.hpp"
 
+#include <QBuffer>
 #include <QCoreApplication>
+#include <QMutexLocker>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <QDir>
 #include <QSet>
 
@@ -198,6 +202,26 @@ QHash<int, QByteArray> ComparisonModel::roleNames() const {
   };
 }
 
+// ----------------------------------------------------- PreviewImageProvider
+
+QImage PreviewImageProvider::requestImage(const QString&, QSize* size,
+                                          const QSize&) {
+  QByteArray data;
+  {
+    QMutexLocker guard(&lock_);
+    data = jpeg_;
+  }
+  QImage image;
+  if (!data.isEmpty()) image.loadFromData(data, "JPG");
+  if (size) *size = image.size();
+  return image;
+}
+
+void PreviewImageProvider::setFrame(const QByteArray& jpeg) {
+  QMutexLocker guard(&lock_);
+  jpeg_ = jpeg;
+}
+
 // --------------------------------------------------------- MonitorController
 
 MonitorController::MonitorController(QObject* parent) : QObject(parent) {
@@ -224,6 +248,23 @@ MonitorController::MonitorController(QObject* parent) : QObject(parent) {
 
   // One timer drives everything, like the web dashboard's 1 Hz poll: session
   // state, the active run's charts, and periodically the history list.
+  preview_provider_ = new PreviewImageProvider();
+  // The callback fires on the decoder thread; hop to the UI thread before
+  // touching provider state or emitting, since QML must not be poked from
+  // another thread.
+  preview_.set_on_frame([this] {
+    QMetaObject::invokeMethod(this, [this] {
+      const auto jpeg = preview_.latest_jpeg();
+      if (!jpeg.empty()) {
+        preview_provider_->setFrame(
+            QByteArray(reinterpret_cast<const char*>(jpeg.data()),
+                       static_cast<qsizetype>(jpeg.size())));
+        preview_frame_++;
+        emit previewChanged();
+      }
+    }, Qt::QueuedConnection);
+  });
+
   connect(&timer_, &QTimer::timeout, this, &MonitorController::tick);
   timer_.start(1000);
   emit pathsChanged();
@@ -312,8 +353,16 @@ void MonitorController::startRun(const QString& phone, const QString& protocol,
   req.warmup_s = warmup;
   req.manual_phone = manualPhone;
 
+  // Preview first so the receiver can be told where to mirror frames. A
+  // preview failure is never fatal to a run: port 0 simply means no picture.
+  const int preview_port = preview_.start(req.protocol);
+  req.preview_port = preview_port;
+  emit previewChanged();
+
   std::string error;
   if (!receiver_.start(req, &error)) {
+    preview_.stop();
+    emit previewChanged();
     emit errorRaised(QString::fromStdString(error));
     return;
   }
@@ -327,7 +376,9 @@ void MonitorController::startRun(const QString& phone, const QString& protocol,
 
 void MonitorController::stopRun() {
   receiver_.stop();
+  preview_.stop();
   emit sessionChanged();
+  emit previewChanged();
 }
 
 void MonitorController::selectRun(const QString& file) {
@@ -347,6 +398,95 @@ bool MonitorController::saveGroup(const QString& group) {
   reselect();
   emit selectionChanged();
   return true;
+}
+
+QString MonitorController::previewState() const {
+  return QString::fromLatin1(ucv::to_string(preview_.state()));
+}
+
+QString MonitorController::previewNote() const {
+  const std::string err = preview_.error();
+  if (!err.empty()) return QString::fromStdString(err);
+  switch (preview_.state()) {
+    case ucv::PreviewState::Idle:
+      return "Preview muncul setelah Start measurement.";
+    case ucv::PreviewState::Waiting:
+      return "Menunggu frame dari HP...";
+    case ucv::PreviewState::Live:
+      return "LIVE - salinan lokal setelah frame diterima";
+    case ucv::PreviewState::Stopped:
+      return "Run selesai - menampilkan frame terakhir";
+    case ucv::PreviewState::Error:
+      return "Preview error";
+  }
+  return {};
+}
+
+int MonitorController::previewFrame() const { return preview_frame_; }
+
+QStringList MonitorController::resolutionLabels() const {
+  QStringList out;
+  out.reserve(static_cast<int>(resolutions_.size()));
+  for (const ucv::CameraResolution& r : resolutions_)
+    out << QString::fromStdString(r.label());
+  return out;
+}
+
+QString MonitorController::modesStatus() const { return modes_status_; }
+
+QString MonitorController::selectedMode() const {
+  if (resolution_index_ < 0 ||
+      resolution_index_ >= static_cast<int>(resolutions_.size()))
+    return {};
+  return QString::fromStdString(
+      resolutions_[static_cast<std::size_t>(resolution_index_)].best_mode());
+}
+
+void MonitorController::selectResolution(int index) {
+  resolution_index_ = index;
+  if (index >= 0 && index < static_cast<int>(resolutions_.size())) {
+    const auto& r = resolutions_[static_cast<std::size_t>(index)];
+    modes_status_ = QString("Dipilih: %1 - FPS auto (%2, tertinggi yang "
+                            "didukung kamera).")
+                        .arg(QString::fromStdString(r.label()))
+                        .arg(r.fps.empty() ? 0 : r.fps.front());
+  }
+  emit modesChanged();
+}
+
+void MonitorController::refreshCameraModes(const QString& phone) {
+  if (modes_busy_) return;
+  modes_busy_ = true;
+  modes_status_ = "Membaca descriptor MJPEG dari kamera HP...";
+  emit modesChanged();
+
+  // Off the UI thread: enumerating up to 256 modes with a 600 ms timeout each
+  // would freeze the window for minutes if the phone does not answer.
+  const std::string ip = phone.trimmed().toStdString();
+  auto* watcher = new QFutureWatcher<ucv::CameraModeQuery>(this);
+  connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher] {
+    const ucv::CameraModeQuery q = watcher->result();
+    watcher->deleteLater();
+    modes_busy_ = false;
+    if (!q.ok) {
+      resolutions_.clear();
+      resolution_index_ = -1;
+      modes_status_ = QString::fromStdString(q.error);
+      emit modesChanged();
+      emit errorRaised(QString::fromStdString(q.error));
+      return;
+    }
+    resolutions_ = q.resolutions;
+    // Default to the smallest mode: high resolutions are the ones that stall
+    // over isochronous USB, so the conservative choice is the safe default.
+    resolution_index_ = resolutions_.empty() ? -1 : 0;
+    modes_status_ = QString("%1 resolusi MJPEG ditemukan.")
+                        .arg(resolutions_.size());
+    if (resolution_index_ >= 0) selectResolution(resolution_index_);
+    emit modesChanged();
+  });
+  watcher->setFuture(QtConcurrent::run(
+      [ip] { return ucv::query_camera_modes(ip); }));
 }
 
 void MonitorController::refreshRuns() {

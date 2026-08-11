@@ -5,7 +5,7 @@
 # speculatively. If Qt is absent, configure the project with -DUCV_BUILD_UI=OFF
 # and the core library and its tests still build.
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Concurrent)
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -31,6 +31,7 @@ target_link_libraries(ucv-monitor PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
+    Qt6::Concurrent
 )
 
 set_target_properties(ucv-monitor PROPERTIES

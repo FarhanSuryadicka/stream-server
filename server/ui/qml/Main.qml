@@ -150,6 +150,39 @@ ApplicationWindow {
                             }
                         }
 
+                        Label {
+                            text: "MJPEG resolution"
+                            color: window.muted
+                            font.pixelSize: 12
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            ComboBox {
+                                id: resolutionBox
+                                Layout.fillWidth: true
+                                model: controller.resolutionLabels.length > 0
+                                       ? controller.resolutionLabels
+                                       : ["Refresh camera modes dulu"]
+                                enabled: controller.resolutionLabels.length > 0
+                                onActivated: controller.selectResolution(currentIndex)
+                            }
+                            Button {
+                                text: controller.modesBusy ? "Membaca..." : "Refresh"
+                                enabled: !controller.modesBusy
+                                onClicked: controller.refreshCameraModes(phoneField.text)
+                            }
+                        }
+
+                        Label {
+                            text: controller.modesStatus
+                            visible: controller.modesStatus.length > 0
+                            color: window.muted
+                            font.pixelSize: 11
+                            wrapMode: Text.Wrap
+                            Layout.fillWidth: true
+                        }
+
                         CheckBox {
                             id: manualPhone
                             text: "Manual phone (jangan remote START)"
@@ -163,7 +196,12 @@ ApplicationWindow {
                                 enabled: !controller.running && controller.receiverPresent
                                 onClicked: controller.startRun(
                                     phoneField.text, protocolBox.currentText,
-                                    runIdField.text, modeField.text,
+                                    runIdField.text,
+                                    // Typed mode wins; otherwise use the one the
+                                    // camera actually advertised.
+                                    modeField.text.trim().length > 0
+                                        ? modeField.text
+                                        : controller.selectedMode,
                                     durationBox.value, warmupBox.value,
                                     manualPhone.checked)
                             }
@@ -233,6 +271,99 @@ ApplicationWindow {
                                 onTextChanged: cursorPosition = length
                             }
                         }
+                    }
+                }
+            }
+
+            // -------------------------------------------------- live preview
+            Frame {
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                Layout.rightMargin: 16
+                background: Rectangle {
+                    color: window.panel; radius: 14
+                    border.color: window.line
+                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            text: "LIVE CAMERA PREVIEW"
+                            color: window.green
+                            font.pixelSize: 13
+                            font.bold: true
+                            font.letterSpacing: 1
+                        }
+                        Item { Layout.fillWidth: true }
+                        Label {
+                            text: controller.previewState
+                            color: controller.previewState === "live" ? window.green
+                                 : controller.previewState === "error" ? window.red
+                                 : window.amber
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 300
+                        color: "#101713"
+                        radius: 12
+                        clip: true
+
+                        Image {
+                            id: previewImage
+                            anchors.fill: parent
+                            anchors.margins: 2
+                            fillMode: Image.PreserveAspectFit
+                            cache: false
+                            asynchronous: true
+                            // The frame counter is part of the URL so Qt treats
+                            // each frame as a new image; without it the cache
+                            // would show the first frame forever.
+                            source: controller.previewFrame > 0
+                                    ? "image://preview/f" + controller.previewFrame
+                                    : ""
+                            visible: controller.previewFrame > 0
+                        }
+
+                        Label {
+                            anchors.centerIn: parent
+                            visible: controller.previewFrame === 0
+                            text: controller.previewNote
+                            color: "#d8e9df"
+                            font.pixelSize: 13
+                        }
+
+                        Rectangle {
+                            visible: controller.previewFrame > 0
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 12
+                            radius: 8
+                            color: "#07100dcc"
+                            width: noteLabel.implicitWidth + 18
+                            height: noteLabel.implicitHeight + 12
+                            Label {
+                                id: noteLabel
+                                anchors.centerIn: parent
+                                text: controller.previewNote
+                                color: "#d8e9df"
+                                font.pixelSize: 12
+                            }
+                        }
+                    }
+
+                    Label {
+                        text: "Preview didekode oleh FFmpeg di PC (MJPEG langsung tanpa decode). " +
+                              "Jalur ini hanya salinan lokal setelah frame diterima, sehingga tidak " +
+                              "mengambil port video dari pengukur."
+                        color: window.muted
+                        font.pixelSize: 11
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
                     }
                 }
             }

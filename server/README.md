@@ -16,6 +16,12 @@ intended production control-room stack. This is the first step in that
 direction, deliberately scoped to what the project can actually feed today:
 measurement runs and their metrics.
 
+It covers the same ground as the web dashboard: start/stop a measurement, choose
+the camera's advertised MJPEG resolution, live camera preview, live
+latency/jitter/loss charts, run history, and manual comparison groups. Both
+front ends read the same NDJSON and share `.dashboard-labels.json`, so a group
+labelled in one shows up in the other.
+
 It is **not** the production surveillance server. Multi-room grids, alerts,
 recording, SQLite and RBAC (§5) are not implemented, because the data they
 would display does not exist yet — there is no AI event source and no
@@ -57,6 +63,31 @@ documented place (`core/src/metrics.cpp`) and mirror `experiment/dashboard/serve
 `core/tests/parity_test.cpp` asserts these against fixed inputs, so a change to
 either dashboard that silently alters a number fails a test rather than
 producing two different answers for the same log.
+
+## Live preview
+
+Same pipeline as the web dashboard, for the same reason: the receiver is the
+only listener on the video port, so a second socket competing for the phone's
+packets could corrupt the measurement. The receiver mirrors each complete frame
+to a localhost UDP port *after* reception, and the preview reads from there —
+it therefore cannot affect a single number in the run.
+
+H.264 protocols are decoded by FFmpeg (h264 to mjpeg over stdio) with the same
+arguments the Python dashboard uses, so neither preview is "the good one".
+MJPEG already carries JPEG and is passed through untouched, which is why its
+preview works with no FFmpeg installed at all.
+
+## Camera modes
+
+"Refresh camera modes" asks the phone's control agent (UDP 8200) to enumerate
+what the camera actually advertises, over the shared wire contract in
+`experiment/receiver/include/ucv_wire.h`. Offering a fixed list instead would
+let an operator pick a mode the camera does not have, and that fails at START
+with an error indistinguishable from a network fault.
+
+The query runs off the UI thread: enumerating up to 256 indices with a 600 ms
+timeout each would otherwise freeze the window for minutes when the phone is not
+answering.
 
 ## Build
 

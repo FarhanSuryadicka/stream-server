@@ -170,6 +170,10 @@ bool ReceiverProcess::start(const RunRequest& request, std::string* error) {
     args.push_back("--video-port");
     args.push_back(std::to_string(request.video_port));
   }
+  if (request.preview_port > 0) {
+    args.push_back("--preview-port");
+    args.push_back(std::to_string(request.preview_port));
+  }
   if (request.manual_phone) args.push_back("--manual-phone");
 
   {

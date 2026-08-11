@@ -26,6 +26,7 @@ struct RunRequest {
   int duration_s = 60;
   int warmup_s = 5;
   int video_port = 0;          // 0 = protocol default
+  int preview_port = 0;        // 0 = no preview mirroring
   bool manual_phone = false;   // true = do not remote-START the phone
 };
 

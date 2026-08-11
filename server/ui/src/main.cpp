@@ -32,6 +32,8 @@ int main(int argc, char** argv) {
   engine.rootContext()->setContextProperty("runsModel", controller.runs());
   engine.rootContext()->setContextProperty("comparisonModel",
                                            controller.comparison());
+  // The engine takes ownership of the provider.
+  engine.addImageProvider("preview", controller.previewProvider());
 
   // Report why QML failed rather than exiting silently. A GUI build has no
   // console, so a bare "exit 1" is indistinguishable from a crash; warnings are
