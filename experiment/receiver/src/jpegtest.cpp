@@ -171,8 +171,8 @@ static void TestRawSubsamplingLayouts() {
 }
 
 static void TestCallerOwnedOutput() {
-  std::printf("\n[jpeg] decoder writes directly into caller-owned NV12\n");
-  constexpr int kWidth = 18;
+  std::printf("\n[jpeg] aligned luma writes directly into caller-owned NV12\n");
+  constexpr int kWidth = 16;   // exercises direct libjpeg -> Y-plane rows
   constexpr int kHeight = 10;
   constexpr size_t kGuard = 16;
   constexpr uint8_t kSentinel = 0xA5;
@@ -201,6 +201,14 @@ static void TestCallerOwnedOutput() {
       &output_size);
   CHECK(rc == 0, "JPEG decodes into caller-owned storage");
   CHECK(output_size == expected_size, "external output reports exact NV12 size");
+  bool luma_written = rc == 0;
+  for (size_t i = 0; i < static_cast<size_t>(kWidth) * kHeight; ++i) {
+    /* The solid RGB fixture converts to luma around 130. This also verifies
+     * that valid rows in the partial final iMCU were not left in scratch. */
+    if (destination[i] < 120 || destination[i] > 140)
+      luma_written = false;
+  }
+  CHECK(luma_written, "direct path writes every luma row into the destination");
   bool guards_ok = true;
   for (size_t i = 0; i < kGuard; ++i) {
     if (guarded[i] != kSentinel ||

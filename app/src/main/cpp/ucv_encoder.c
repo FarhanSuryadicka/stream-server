@@ -613,22 +613,30 @@ int ucv_jpeg_decode_into_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
     jpeg_abort_decompress(cinfo);
     return -1;
   }
-  if (!d->layout_logged) {
-    if (cinfo->jpeg_color_space == JCS_GRAYSCALE)
-      ELOG_BOTH("jpeg decoder: raw grayscale -> NV12");
-    else
-      ELOG_BOTH("jpeg decoder: raw YCbCr -> NV12 (chroma scale %dx%d)",
-                 h_expand, v_expand);
-    d->layout_logged = 1;
-  }
-
   const int w = d->width, h = d->height;
   uint8_t *Y = nv12;
   uint8_t *UV = nv12 + (size_t)w * h;
+  const size_t y_raw_width =
+      (size_t)cinfo->comp_info[0].width_in_blocks * DCTSIZE;
+  /* Raw libjpeg rows include right-edge DCT padding. When no padding is
+   * needed, point those rows straight at MediaCodec's Y plane and eliminate
+   * the per-row luma memcpy. Non-aligned widths retain the scratch fallback. */
+  const int direct_luma = y_raw_width == (size_t)w;
   const JDIMENSION lines_per_iMCU =
       (JDIMENSION)cinfo->max_v_samp_factor * DCTSIZE;
   JSAMPARRAY planes[UCV_JPEG_COMPONENTS] = {
       d->raw_rows[0], d->raw_rows[1], d->raw_rows[2]};
+
+  if (!d->layout_logged) {
+    if (cinfo->jpeg_color_space == JCS_GRAYSCALE)
+      ELOG_BOTH("jpeg decoder: raw grayscale -> NV12 (luma=%s)",
+                direct_luma ? "direct" : "scratch");
+    else
+      ELOG_BOTH("jpeg decoder: raw YCbCr -> NV12 (chroma scale %dx%d, "
+                "luma=%s)", h_expand, v_expand,
+                direct_luma ? "direct" : "scratch");
+    d->layout_logged = 1;
+  }
 
   for (int component = 0; component < cinfo->num_components; component++) {
     if ((size_t)cinfo->comp_info[component].width_in_blocks * DCTSIZE >
@@ -641,6 +649,13 @@ int ucv_jpeg_decode_into_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
 
   while ((int)cinfo->output_scanline < h) {
     const int y_base = (int)cinfo->output_scanline;
+    for (int row = 0; row < (int)lines_per_iMCU; row++) {
+      const int output_y = y_base + row;
+      d->raw_rows[0][row] =
+          direct_luma && output_y < h
+              ? Y + (size_t)output_y * w
+              : d->raw[0] + (size_t)row * d->raw_stride;
+    }
     if (jpeg_read_raw_data(cinfo, planes, lines_per_iMCU) == 0) {
       jpeg_abort_decompress(cinfo);
       return -1;
@@ -648,8 +663,11 @@ int ucv_jpeg_decode_into_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
     const int rows = h - y_base < (int)lines_per_iMCU
         ? h - y_base : (int)lines_per_iMCU;
 
-    for (int row = 0; row < rows; row++)
-      memcpy(Y + (size_t)(y_base + row) * w, d->raw_rows[0][row], (size_t)w);
+    if (!direct_luma) {
+      for (int row = 0; row < rows; row++)
+        memcpy(Y + (size_t)(y_base + row) * w,
+               d->raw_rows[0][row], (size_t)w);
+    }
 
     for (int row = 0; row < rows; row++) {
       const int output_y = y_base + row;
