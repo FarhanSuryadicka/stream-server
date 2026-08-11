@@ -2,6 +2,9 @@
 
 Tanggal handoff: 11 Agustus 2026
 
+> **Cara build dan menjalankan semuanya (HP, dashboard web, aplikasi
+> desktop): [`PANDUAN-LENGKAP.md`](PANDUAN-LENGKAP.md).**
+
 ## 1. Lokasi proyek yang benar
 
 Repository aktif:

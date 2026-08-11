@@ -1,5 +1,8 @@
 # UCV Transport Lab — Runbook Terbaru
 
+> Untuk panduan dari nol termasuk build APK dan aplikasi desktop, lihat
+> [`../docs/PANDUAN-LENGKAP.md`](../docs/PANDUAN-LENGKAP.md).
+
 Dokumen ini adalah panduan operasional utama untuk build saat ini. Gunakan
 dokumen ini ketika memindahkan pekerjaan ke Claude atau sesi pengembangan lain.
 

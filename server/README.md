@@ -95,6 +95,29 @@ Requires Qt 6.5+ and CMake 3.21+. Qt is **not** vendored — it is a large
 external SDK and `FUTURE-SERVER-ARCHITECTURE.md` §6 explicitly warns against
 adding it to the tree speculatively.
 
+### The short version
+
+Everything is native Windows — **no WSL, no MSYS2**. Two scripts wrap the CMake
+invocations below:
+
+```powershell
+.\server\build.ps1              # build + test the full app
+.\server\run.ps1                # launch it
+```
+
+Useful switches:
+
+| Command | What it does |
+|---|---|
+| `.\server\build.ps1 -CoreOnly` | measurement logic + tests only, no Qt required |
+| `.\server\build.ps1 -Clean` | delete the build directory first (see the warning below) |
+| `.\server\build.ps1 -Run` | launch as soon as the build succeeds |
+| `.\server\run.ps1 -Console` | show Qt/QML log output, for when something misbehaves |
+
+The rest of this section explains what those scripts do, and is worth reading
+once because two of the details are non-obvious and cost a long debugging
+session to find.
+
 ### Core only — no Qt needed
 
 Useful on any machine, and the fastest way to check that the measurement logic
