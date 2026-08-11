@@ -84,6 +84,27 @@ class TcpClient {
   SocketHandle fd_ = kInvalidSocket;
 };
 
+// Accepts one inbound TCP connection. RTMP inverts the usual direction — the
+// phone PUBLISHES to us — so the receiver has to listen rather than dial.
+// Deliberately single-client: a second publisher would add traffic to the very
+// link being measured.
+class TcpServer {
+ public:
+  ~TcpServer();
+  bool Listen(int port);
+  // Waits up to timeout_ms for a client. Bounded rather than blocking so the
+  // caller keeps servicing the run deadline and the control channel.
+  bool AcceptTimeout(int timeout_ms);
+  bool Connected() const { return client_ != kInvalidSocket; }
+  int  RecvTimeout(void* buf, size_t len, int timeout_ms);
+  bool SendAll(const void* data, size_t len);
+  void Close();
+
+ private:
+  SocketHandle listen_ = kInvalidSocket;
+  SocketHandle client_ = kInvalidSocket;
+};
+
 // Result of the SNTP-style exchange in harness spec §4.1.
 struct ClockSync {
   int64_t offset_ns   = 0;  // phone_clock - pc_clock

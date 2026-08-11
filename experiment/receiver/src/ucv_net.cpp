@@ -18,6 +18,7 @@
 #else
   #include <arpa/inet.h>
   #include <netinet/in.h>
+  #include <netinet/tcp.h>  // TCP_NODELAY for the RTMP listener
   #include <sys/socket.h>
   #include <unistd.h>
   #define CLOSESOCK close
@@ -263,6 +264,85 @@ void TcpClient::Close() {
   if (fd_ != kInvalidSocket) {
     CLOSESOCK(fd_);
     fd_ = kInvalidSocket;
+  }
+}
+
+// ------------------------------------------------------------ TcpServer
+
+TcpServer::~TcpServer() { Close(); }
+
+bool TcpServer::Listen(int port) {
+  Close();
+  listen_ = static_cast<SocketHandle>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+  if (listen_ == kInvalidSocket) return false;
+  int one = 1;
+  setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR,
+             reinterpret_cast<const char*>(&one), sizeof(one));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  if (bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    Close();
+    return false;
+  }
+  if (listen(listen_, 1) != 0) {
+    Close();
+    return false;
+  }
+  return true;
+}
+
+bool TcpServer::AcceptTimeout(int timeout_ms) {
+  if (client_ != kInvalidSocket) return true;
+  if (listen_ == kInvalidSocket) return false;
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(listen_, &rfds);
+  timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  if (select(SelectNfds(listen_), &rfds, nullptr, nullptr, &tv) <= 0) return false;
+  client_ = static_cast<SocketHandle>(accept(listen_, nullptr, nullptr));
+  if (client_ == kInvalidSocket) return false;
+  // Nagle would batch the publisher's small chunks and add delay that belongs
+  // to a socket option rather than to RTMP.
+  int one = 1;
+  setsockopt(client_, IPPROTO_TCP, TCP_NODELAY,
+             reinterpret_cast<const char*>(&one), sizeof(one));
+  return true;
+}
+
+int TcpServer::RecvTimeout(void* buf, size_t len, int timeout_ms) {
+  if (client_ == kInvalidSocket) return -1;
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(client_, &rfds);
+  timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  const int ready = select(SelectNfds(client_), &rfds, nullptr, nullptr, &tv);
+  if (ready <= 0) return ready == 0 ? 0 : -1;
+  const int n = recv(client_, static_cast<char*>(buf), static_cast<int>(len), 0);
+  return n > 0 ? n : -1;
+}
+
+bool TcpServer::SendAll(const void* data, size_t len) {
+  if (client_ == kInvalidSocket) return false;
+  const char* bytes = static_cast<const char*>(data);
+  size_t off = 0;
+  while (off < len) {
+    const int n = send(client_, bytes + off, static_cast<int>(len - off), 0);
+    if (n <= 0) return false;
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+void TcpServer::Close() {
+  if (client_ != kInvalidSocket) {
+    CLOSESOCK(client_);
+    client_ = kInvalidSocket;
+  }
+  if (listen_ != kInvalidSocket) {
+    CLOSESOCK(listen_);
+    listen_ = kInvalidSocket;
   }
 }
 

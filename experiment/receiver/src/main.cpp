@@ -62,11 +62,13 @@ void PrintUsage(const char* argv0) {
       "Usage: %s --phone <ip> [options]\n"
       "\n"
       "  --phone <ip>          Phone IP address (required)\n"
-      "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg | hls\n"
-      "                        (default: raw_udp. rtsp receives the same RTP\n"
-      "                         packets as rtp_udp; only the sender differs,\n"
-      "                         so the run records which one was used. hls\n"
-      "                         polls the phone's playlist over HTTP.)\n"
+      "  --protocol <name>     raw_udp | rtp_udp | rtsp | srt | mjpeg |\n"
+      "                        hls | rtmp        (default: raw_udp)\n"
+      "                        rtsp receives the same RTP packets as rtp_udp;\n"
+      "                        only the sender differs, so the run records\n"
+      "                        which one was used. hls polls the phone's\n"
+      "                        playlist over HTTP. rtmp LISTENS: the phone\n"
+      "                        publishes to us (plaintext, not rtmps).\n"
       "  --video-port <n>      Video port      (default: protocol default)\n"
       "  --control-port <n>    Control port    (default: %d)\n"
       "  --duration <s>        Run length      (default: 120)\n"
@@ -133,6 +135,10 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     o->video_port = UCV_PORT_RTP;
   if (o->protocol == "hls" && o->video_port == UCV_PORT_RAWUDP)
     o->video_port = UCV_PORT_HLS;
+  // RTMP inverts the direction: the phone publishes to us, so this is
+  // the port WE listen on.
+  if (o->protocol == "rtmp" && o->video_port == UCV_PORT_RAWUDP)
+    o->video_port = UCV_PORT_RTMPS;
   if (o->preview_port < 0 || o->preview_port > 65535) {
     std::fprintf(stderr, "error: invalid --preview-port\n");
     return false;
@@ -652,6 +658,225 @@ class HlsReader {
   uint64_t segment_bytes_ = 0;
 };
 
+// RTMP reader: the receiver acts as the media server the phone publishes to,
+// which is the role MediaMTX or nginx-rtmp would normally fill. Implementing it
+// here keeps the measurement path down to two boxes and, more importantly,
+// keeps the receive timestamp on the same clock as every other protocol — going
+// through a third-party server would put its buffering inside the number.
+//
+// Only what a publisher actually sends is parsed: handshake, chunk headers, the
+// AMF0 metadata carrying the per-frame timestamps, and FLV video tags. Commands
+// from the publisher are acknowledged loosely, because a publisher that is not
+// waiting on a reply cannot be blocked by one.
+class RtmpReader {
+ public:
+  bool Listen(int port) { return server_.Listen(port); }
+
+  // Completes the RTMP handshake with a connecting publisher.
+  bool Accept(int timeout_ms) {
+    if (!server_.AcceptTimeout(timeout_ms)) return false;
+    // C0 + C1
+    uint8_t c0c1[1 + 1536];
+    if (!ReadExact(c0c1, sizeof(c0c1), 5000)) return false;
+    if (c0c1[0] != 3) return false;
+    // S0 + S1 + S2. S2 must echo C1 or a strict publisher aborts.
+    uint8_t s[1 + 1536 + 1536];
+    std::memset(s, 0, sizeof(s));
+    s[0] = 3;
+    for (int i = 1; i < 1 + 1536; i++) s[i] = static_cast<uint8_t>(i * 11);
+    std::memcpy(s + 1 + 1536, c0c1 + 1, 1536);
+    if (!server_.SendAll(s, sizeof(s))) return false;
+    // C2
+    uint8_t c2[1536];
+    if (!ReadExact(c2, sizeof(c2), 5000)) return false;
+    return true;
+  }
+
+  // Returns 1 when a frame was produced, 0 on timeout, -1 when the publisher
+  // disconnected.
+  int ReadFrame(Reassembler::Complete* out, int timeout_ms) {
+    for (;;) {
+      if (TryParse(out)) return 1;
+      uint8_t chunk[16384];
+      const int n = server_.RecvTimeout(chunk, sizeof(chunk), timeout_ms);
+      if (n == 0) return 0;
+      if (n < 0) return -1;
+      buffer_.insert(buffer_.end(), chunk, chunk + n);
+      wire_bytes_ += static_cast<uint64_t>(n);
+      if (buffer_.size() > 64u * 1024u * 1024u) return -1;  // runaway guard
+    }
+  }
+
+  uint64_t wire_bytes() const { return wire_bytes_; }
+  uint64_t video_tags() const { return video_tags_; }
+
+ private:
+  bool ReadExact(void* dst, size_t len, int timeout_ms) {
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    size_t got = 0;
+    while (got < len) {
+      const int n = server_.RecvTimeout(p + got, len - got, timeout_ms);
+      if (n <= 0) return false;
+      got += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  // Reassembles one RTMP message from the chunk stream. Returns true when a
+  // video tag completed and `out` was filled.
+  bool TryParse(Reassembler::Complete* out) {
+    for (;;) {
+      size_t pos = 0;
+      if (buffer_.size() < 1) return false;
+      const uint8_t b0 = buffer_[0];
+      const uint8_t fmt = static_cast<uint8_t>(b0 >> 6);
+      uint32_t csid = b0 & 0x3f;
+      pos = 1;
+      // Extended chunk stream ids are legal; the phone uses small ones, but
+      // rejecting them outright would make this brittle against other senders.
+      if (csid == 0) { if (buffer_.size() < 2) return false; csid = 64u + buffer_[1]; pos = 2; }
+      else if (csid == 1) {
+        if (buffer_.size() < 3) return false;
+        csid = 64u + buffer_[1] + 256u * buffer_[2];
+        pos = 3;
+      }
+
+      // Header sizes AFTER the basic header, per the RTMP chunk spec:
+      //   fmt 0 = 11 bytes (ts 3 + length 3 + type 1 + message stream id 4)
+      //   fmt 1 =  7 bytes (ts delta 3 + length 3 + type 1)
+      //   fmt 2 =  3 bytes (ts delta 3)
+      //   fmt 3 =  0 bytes (continuation: reuse everything)
+      // The message stream id is part of the 11, not extra — adding it again
+      // swallowed 4 payload bytes per message and desynchronised the whole
+      // stream after the first one.
+      const size_t header_len = fmt == 0 ? 11 : fmt == 1 ? 7 : fmt == 2 ? 3 : 0;
+      if (buffer_.size() < pos + header_len) return false;
+
+      ChunkState& st = streams_[csid];
+      if (fmt <= 2) st.timestamp = Be24(&buffer_[pos]);
+      if (fmt <= 1) {
+        st.length = Be24(&buffer_[pos + 3]);
+        st.type = buffer_[pos + 6];
+      }
+      pos += header_len;
+      if (st.length == 0 || st.length > 32u * 1024u * 1024u) {
+        buffer_.clear();
+        return false;
+      }
+
+      const size_t remaining = st.length - st.payload.size();
+      const size_t take = std::min<size_t>(remaining, chunk_size_);
+      if (buffer_.size() < pos + take) return false;
+
+      st.payload.insert(st.payload.end(), buffer_.begin() + pos,
+                        buffer_.begin() + pos + take);
+      buffer_.erase(buffer_.begin(), buffer_.begin() + pos + take);
+
+      if (st.payload.size() < st.length) continue;  // more chunks to come
+
+      std::vector<uint8_t> message;
+      message.swap(st.payload);
+      const uint8_t type = st.type;
+      const uint32_t ts = st.timestamp;
+      st.length = 0;
+
+      if (type == 1 && message.size() >= 4) {          // Set Chunk Size
+        const uint32_t size = (uint32_t(message[0]) << 24) |
+                              (uint32_t(message[1]) << 16) |
+                              (uint32_t(message[2]) << 8) | message[3];
+        if (size >= 128 && size <= 16777215) chunk_size_ = size;
+        continue;
+      }
+      if (type == 18 || type == 15) { ParseMetadata(message); continue; }
+      if (type == 20 || type == 17) { continue; }      // commands: not needed
+      if (type == 9) {
+        if (BuildFrame(message, ts, out)) return true;
+        continue;
+      }
+      // Anything else (audio, user control, acks) is irrelevant to the video
+      // measurement and is dropped rather than guessed at.
+    }
+  }
+
+  // Pulls the per-frame timestamps out of the sender's @setDataFrame/onUCV
+  // AMF0 object. RTMP has no per-frame header, so this metadata IS the
+  // instrumentation channel; without it a frame cannot be scored and is
+  // dropped rather than timed against the wrong clock.
+  void ParseMetadata(const std::vector<uint8_t>& m) {
+    double seq = 0, cap = 0, enc = 0, snd = 0;
+    bool have_seq = false, have_cap = false, have_snd = false;
+    for (size_t i = 0; i + 2 < m.size();) {
+      const uint16_t klen = static_cast<uint16_t>((m[i] << 8) | m[i + 1]);
+      if (klen == 0 || klen > 64 || i + 2 + klen + 9 > m.size()) { i++; continue; }
+      const std::string key(reinterpret_cast<const char*>(&m[i + 2]), klen);
+      const size_t vpos = i + 2 + klen;
+      if (m[vpos] != 0x00) { i++; continue; }          // AMF0 number marker
+      uint64_t bits = 0;
+      for (int b = 0; b < 8; b++)
+        bits = (bits << 8) | m[vpos + 1 + b];
+      double value = 0;
+      std::memcpy(&value, &bits, sizeof(value));
+      if (key == "seq") { seq = value; have_seq = true; }
+      else if (key == "cap") { cap = value; have_cap = true; }
+      else if (key == "enc") { enc = value; }
+      else if (key == "snd") { snd = value; have_snd = true; }
+      i = vpos + 9;
+    }
+    if (have_seq && have_cap && have_snd) {
+      pending_seq_ = static_cast<uint32_t>(seq);
+      pending_cap_ = static_cast<uint64_t>(cap);
+      pending_enc_ = static_cast<uint64_t>(enc);
+      pending_snd_ = static_cast<uint64_t>(snd);
+      have_pending_ = true;
+    }
+  }
+
+  bool BuildFrame(const std::vector<uint8_t>& tag, uint32_t /*ts*/,
+                  Reassembler::Complete* out) {
+    if (tag.size() < 5) return false;
+    const uint8_t frame_type = static_cast<uint8_t>(tag[0] >> 4);
+    const uint8_t packet_type = tag[1];
+    if (packet_type == 0) return false;   // AVC sequence header, not a frame
+    video_tags_++;
+    if (!have_pending_) return false;     // no instrumentation: cannot score it
+
+    out->seq = pending_seq_;
+    out->t_capture_ns = pending_cap_;
+    out->t_encoded_ns = pending_enc_;
+    out->t_sent_ns = pending_snd_;
+    out->t_recv_ns = ucv::NowNs();
+    // Payload bytes are the media bytes, excluding the 5-byte FLV video header,
+    // so the figure is comparable with the other protocols' frame sizes.
+    out->bytes = static_cast<uint32_t>(tag.size() - 5);
+    out->keyframe = (frame_type == 1);
+    out->run_hash = 0;
+    out->wire_bytes = 0;   // accounted in wire_bytes() at the socket level
+    have_pending_ = false;
+    return true;
+  }
+
+  static uint32_t Be24(const uint8_t* p) {
+    return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
+  }
+
+  struct ChunkState {
+    uint32_t timestamp = 0;
+    uint32_t length = 0;
+    uint8_t  type = 0;
+    std::vector<uint8_t> payload;
+  };
+
+  ucv::TcpServer server_;
+  std::vector<uint8_t> buffer_;
+  std::map<uint32_t, ChunkState> streams_;
+  uint32_t chunk_size_ = 128;          // RTMP default until Set Chunk Size
+  uint64_t wire_bytes_ = 0;
+  uint64_t video_tags_ = 0;
+  uint32_t pending_seq_ = 0;
+  uint64_t pending_cap_ = 0, pending_enc_ = 0, pending_snd_ = 0;
+  bool have_pending_ = false;
+};
+
 class SrtReceiver {
  public:
   ~SrtReceiver() { Close(); }
@@ -806,6 +1031,7 @@ int main(int argc, char** argv) {
   ucv::UdpSender preview;
   MjpegReader mjpeg;
   HlsReader hls;
+  RtmpReader rtmp;
   SrtReceiver srt;
   if (opt.protocol == "raw_udp" || opt.protocol == "rtp_udp" ||
       opt.protocol == "rtsp") {
@@ -831,6 +1057,17 @@ int main(int argc, char** argv) {
     if (!srt.Listen(opt.video_port)) {
       std::fprintf(stderr, "fatal: cannot listen for SRT on :%d: %s\n",
                    opt.video_port, srt_getlasterror_str());
+      return 1;
+    }
+    if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
+      std::fprintf(stderr, "warning: cannot open local preview output :%d\n",
+                   opt.preview_port);
+      opt.preview_port = 0;
+    }
+  } else if (opt.protocol == "rtmp") {
+    if (!rtmp.Listen(opt.video_port)) {
+      std::fprintf(stderr, "fatal: cannot listen for RTMP on :%d\n",
+                   opt.video_port);
       return 1;
     }
     if (opt.preview_port && !preview.Open("127.0.0.1", opt.preview_port)) {
@@ -864,7 +1101,8 @@ int main(int argc, char** argv) {
     const uint8_t protocol_id = opt.protocol == "mjpeg" ? UCV_PROTO_MJPEG :
         (rtp_wire ? UCV_PROTO_RTSP :
          (opt.protocol == "srt" ? UCV_PROTO_SRT :
-          (opt.protocol == "hls" ? UCV_PROTO_HLS : UCV_PROTO_RAWUDP)));
+          (opt.protocol == "hls" ? UCV_PROTO_HLS :
+           (opt.protocol == "rtmp" ? UCV_PROTO_RTMPS : UCV_PROTO_RAWUDP))));
     if (!control.SetRunHash(opt.run_id) ||
         !control.StartRemoteRun(mode_w, mode_h, mode_fps,
                                 protocol_id, opt.video_port)) {
@@ -900,6 +1138,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     std::printf("[recv] SRT connected (live/message, latency=20ms, encryption=off)\n");
+  } else if (opt.protocol == "rtmp") {
+    if (!rtmp.Accept(10000)) {
+      std::fprintf(stderr, "fatal: phone did not publish RTMP to :%d\n",
+                   opt.video_port);
+      if (opt.remote_phone) control.StopRemoteRun();
+      return 2;
+    }
+    std::printf("[recv] RTMP publisher connected (plaintext, not rtmps)\n");
   } else if (opt.protocol == "hls") {
     hls.Configure(opt.phone_ip, opt.video_port);
     std::printf("[recv] polling HLS playlist http://%s:%d/live.m3u8\n",
@@ -1014,6 +1260,43 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(frames_in_window),
                     transport_ms.Percentile(0.50), jitter.jitter_ms(),
                     tcp_loss);
+        last_report = now;
+      }
+      continue;
+    }
+
+    if (opt.protocol == "rtmp") {
+      Reassembler::Complete f;
+      const int result = rtmp.ReadFrame(&f, 200);
+      if (result == 0) continue;
+      if (result < 0) {
+        std::fprintf(stderr, "warning: RTMP publisher disconnected\n");
+        break;
+      }
+      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!seq.Observe(f.seq)) continue;
+
+      const double transport = (static_cast<int64_t>(f.t_recv_ns) +
+                                sync_before.offset_ns -
+                                static_cast<int64_t>(f.t_sent_ns)) / 1e6;
+      const double glass = (static_cast<int64_t>(f.t_recv_ns) +
+                            sync_before.offset_ns -
+                            static_cast<int64_t>(f.t_capture_ns)) / 1e6;
+      transport_ms.Add(transport);
+      glass_ms.Add(glass);
+      encode_ms.Add((static_cast<int64_t>(f.t_encoded_ns) -
+                     static_cast<int64_t>(f.t_capture_ns)) / 1e6);
+      jitter.Update(static_cast<int64_t>(f.t_sent_ns),
+                    static_cast<int64_t>(f.t_recv_ns));
+      bytes_payload += f.bytes;
+      frames_in_window++;
+      log.WriteFrame(f.seq, f.t_capture_ns, f.t_encoded_ns, f.t_sent_ns,
+                     f.t_recv_ns, f.bytes, f.keyframe, 0, 0);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_report >= std::chrono::seconds(5)) {
+        std::printf("[recv] %6llu RTMP frames  transport p50=%.1f ms  jitter=%.2f ms\n",
+                    static_cast<unsigned long long>(frames_in_window),
+                    transport_ms.Percentile(0.50), jitter.jitter_ms());
         last_report = now;
       }
       continue;
@@ -1332,6 +1615,7 @@ int main(int argc, char** argv) {
               "  • True wire overhead needs a packet capture; the figure above\n"
               "    counts application bytes only and cannot see retransmits.\n");
 
+  if (opt.protocol == "rtmp") bytes_wire = rtmp.wire_bytes();
   const bool udp_protocol = opt.protocol == "raw_udp" || rtp_wire;
   const uint64_t summary_packets_received = opt.protocol == "srt"
       ? srt_received : (udp_protocol ? packets.received() : tcp_segments);
