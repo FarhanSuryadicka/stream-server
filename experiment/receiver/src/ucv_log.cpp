@@ -112,6 +112,7 @@ void NdjsonWriter::WriteSummary(uint64_t frames_received, uint64_t gap_frames,
                                 uint64_t reorder_events, uint64_t duplicates,
                                 uint64_t reassembly_failures,
                                 uint64_t bytes_payload, uint64_t bytes_wire,
+                                uint64_t measurement_duration_ns,
                                 int64_t offset_after_ns, int64_t drift_ns,
                                 bool clock_suspect, uint64_t packets_received,
                                 uint64_t packets_lost,
@@ -124,6 +125,7 @@ void NdjsonWriter::WriteSummary(uint64_t frames_received, uint64_t gap_frames,
                "\"gap_frames\":%llu,\"reorder_events\":%llu,"
                "\"duplicates\":%llu,\"reassembly_failures\":%llu,"
                "\"bytes_payload\":%llu,\"bytes_wire\":%llu,"
+               "\"measurement_duration_ns\":%llu,"
                "\"packets_received\":%llu,\"packets_lost\":%llu,"
                "\"packets_recovered\":%llu,"
                "\"packet_reorder_events\":%llu,\"packet_duplicates\":%llu,"
@@ -136,6 +138,7 @@ void NdjsonWriter::WriteSummary(uint64_t frames_received, uint64_t gap_frames,
                static_cast<unsigned long long>(reassembly_failures),
                static_cast<unsigned long long>(bytes_payload),
                static_cast<unsigned long long>(bytes_wire),
+               static_cast<unsigned long long>(measurement_duration_ns),
                static_cast<unsigned long long>(packets_received),
                static_cast<unsigned long long>(packets_lost),
                static_cast<unsigned long long>(packets_recovered),

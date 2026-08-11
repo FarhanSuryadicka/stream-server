@@ -1454,6 +1454,13 @@ int main(int argc, char** argv) {
                 opt.phone_ip.c_str(), opt.video_port);
   }
 
+  const auto t_start  = std::chrono::steady_clock::now();
+  const auto t_warmup = t_start + std::chrono::seconds(opt.warmup_s);
+  const auto t_end    = t_start + std::chrono::seconds(opt.duration_s);
+  const auto in_measurement_window = [&](auto now) {
+    return now >= t_warmup && now < t_end;
+  };
+
   // ------------------------------------------------------------------
   // 3. Control load thread — RTT measured WHILE video flows
   // ------------------------------------------------------------------
@@ -1469,8 +1476,10 @@ int main(int argc, char** argv) {
         int64_t rtt_ns = 0;
         angle += 0.05f;
         if (angle > 6.28f) angle = 0.0f;
-        control_sent++;
-        if (control.SendSetAlphaAwaitAck(angle, &rtt_ns)) {
+        const bool measured = in_measurement_window(
+            std::chrono::steady_clock::now());
+        if (measured) control_sent++;
+        if (control.SendSetAlphaAwaitAck(angle, &rtt_ns) && measured) {
           control_acked++;
           control_rtt.Add(rtt_ns / 1e6);
         }
@@ -1497,11 +1506,26 @@ int main(int argc, char** argv) {
   uint64_t srt_received = 0, srt_lost = 0, srt_retransmitted = 0;
   uint64_t srt_base_received = 0, srt_base_lost = 0, srt_base_retransmitted = 0;
   bool srt_baseline = false;
+  auto next_srt_stats = t_warmup;
+  const auto sample_srt_stats = [&] {
+    uint64_t received = 0, lost = 0, retransmitted = 0;
+    if (!srt.Stats(&received, &lost, &retransmitted)) return;
+    if (!srt_baseline) {
+      srt_base_received = received;
+      srt_base_lost = lost;
+      srt_base_retransmitted = retransmitted;
+      srt_baseline = true;
+      return;
+    }
+    srt_received = received >= srt_base_received
+        ? received - srt_base_received : 0;
+    srt_lost = lost >= srt_base_lost ? lost - srt_base_lost : 0;
+    srt_retransmitted = retransmitted >= srt_base_retransmitted
+        ? retransmitted - srt_base_retransmitted : 0;
+  };
+  uint64_t rtmp_wire_base = 0;
+  bool rtmp_wire_baseline = false;
   const uint32_t expected_run_hash = ucv_run_id_hash(opt.run_id.c_str());
-
-  const auto t_start   = std::chrono::steady_clock::now();
-  const auto t_warmup  = t_start + std::chrono::seconds(opt.warmup_s);
-  const auto t_end     = t_start + std::chrono::seconds(opt.duration_s);
 
   std::vector<uint8_t> buf(64 * 1024);
   std::printf("[recv] listening... (Ctrl-C to stop early)\n");
@@ -1513,6 +1537,19 @@ int main(int argc, char** argv) {
   std::vector<Reassembler::Complete> hls_pending;
 
   while (!g_quit && std::chrono::steady_clock::now() < t_end) {
+    const auto iteration_now = std::chrono::steady_clock::now();
+    if (opt.protocol == "srt" &&
+        in_measurement_window(iteration_now) &&
+        (!srt_baseline || iteration_now >= next_srt_stats)) {
+      sample_srt_stats();
+      next_srt_stats = iteration_now + std::chrono::milliseconds(250);
+    }
+    if (opt.protocol == "rtmp" && !rtmp_wire_baseline &&
+        in_measurement_window(iteration_now)) {
+      rtmp_wire_base = rtmp.wire_bytes();
+      rtmp_wire_baseline = true;
+    }
+
     if (opt.protocol == "mjpeg") {
       Reassembler::Complete f;
       const int result = mjpeg.ReadFrame(&f, 200);
@@ -1522,9 +1559,9 @@ int main(int argc, char** argv) {
         break;
       }
       if (f.run_hash != expected_run_hash) { wrong_run++; continue; }
-      bytes_wire += f.wire_bytes;
       if (opt.preview_port) SendPreviewFrame(&preview, f, true);
-      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!in_measurement_window(std::chrono::steady_clock::now())) continue;
+      bytes_wire += f.wire_bytes;
       if (!seq.Observe(f.seq)) continue;
 
       if (f.tcp_stats) {
@@ -1573,7 +1610,7 @@ int main(int argc, char** argv) {
       if (result == 0) continue;
       if (result < 0) break;
       if (f.run_hash != expected_run_hash) { wrong_run++; continue; }
-      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      if (!in_measurement_window(std::chrono::steady_clock::now())) continue;
       if (!seq.Observe(f.seq)) continue;
 
       const double transport = (static_cast<int64_t>(f.t_recv_ns) +
@@ -1612,7 +1649,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "warning: RTMP publisher disconnected\n");
         break;
       }
-      if (std::chrono::steady_clock::now() < t_warmup) continue;
+      const auto frame_now = std::chrono::steady_clock::now();
+      if (!in_measurement_window(frame_now)) continue;
+      // A blocking read can straddle the warmup boundary. Its bytes cannot be
+      // split reliably, so establish the baseline and discard that one frame.
+      if (!rtmp_wire_baseline) {
+        rtmp_wire_base = rtmp.wire_bytes();
+        rtmp_wire_baseline = true;
+        continue;
+      }
       if (!seq.Observe(f.seq)) continue;
 
       const double transport = (static_cast<int64_t>(f.t_recv_ns) +
@@ -1656,8 +1701,8 @@ int main(int argc, char** argv) {
       Reassembler::Complete f = std::move(hls_pending.front());
       hls_pending.erase(hls_pending.begin());
 
+      if (!in_measurement_window(std::chrono::steady_clock::now())) continue;
       bytes_wire += f.wire_bytes;
-      if (std::chrono::steady_clock::now() < t_warmup) continue;
       if (!seq.Observe(f.seq)) continue;
 
       const double transport = (static_cast<int64_t>(f.t_recv_ns) +
@@ -1721,25 +1766,11 @@ int main(int argc, char** argv) {
       bad_header++;
       continue;
     }
-    const bool measurement_window = std::chrono::steady_clock::now() >= t_warmup;
+    const bool measurement_window = in_measurement_window(
+        std::chrono::steady_clock::now());
     if (measurement_window && opt.protocol != "srt")
       packets.Observe(h.packet_seq);
-    if (measurement_window && opt.protocol == "srt") {
-      uint64_t received = 0, lost = 0, retransmitted = 0;
-      if (srt.Stats(&received, &lost, &retransmitted)) {
-        if (!srt_baseline) {
-          srt_base_received = received;
-          srt_base_lost = lost;
-          srt_base_retransmitted = retransmitted;
-          srt_baseline = true;
-        }
-        srt_received = received - srt_base_received;
-        srt_lost = lost - srt_base_lost;
-        srt_retransmitted = retransmitted - srt_base_retransmitted;
-      }
-    }
-
-    bytes_wire += static_cast<uint64_t>(n);
+    if (measurement_window) bytes_wire += static_cast<uint64_t>(n);
 
     if (rtp_wire) {
       if (!assembled) continue;
@@ -1754,8 +1785,7 @@ int main(int argc, char** argv) {
     // frames are intentionally excluded from all measurements below.
     if (opt.preview_port) SendPreviewFrame(&preview, f, false);
 
-    const bool in_window = std::chrono::steady_clock::now() >= t_warmup;
-    if (!in_window) continue;   // discard encoder ramp-up / handshake
+    if (!measurement_window) continue;  // discard warmup / trailing frame
 
     if (!seq.Observe(f.seq)) continue;  // duplicate
 
@@ -1801,6 +1831,20 @@ int main(int argc, char** argv) {
     }
   }
 
+  const auto receive_loop_end = std::chrono::steady_clock::now();
+  const auto measurement_end = receive_loop_end < t_end ? receive_loop_end : t_end;
+  const uint64_t measurement_duration_ns = measurement_end > t_warmup
+      ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            measurement_end - t_warmup).count())
+      : 0;
+  const double dur_s = static_cast<double>(measurement_duration_ns) / 1e9;
+
+  if (opt.protocol == "srt" && srt_baseline) sample_srt_stats();
+  if (opt.protocol == "rtmp" && rtmp_wire_baseline) {
+    const uint64_t total = rtmp.wire_bytes();
+    bytes_wire = total >= rtmp_wire_base ? total - rtmp_wire_base : 0;
+  }
+
   g_quit = true;
   if (control_thread.joinable()) control_thread.join();
   if (opt.protocol == "rtsp" && !rtsp_client.Teardown())
@@ -1823,9 +1867,6 @@ int main(int argc, char** argv) {
   // ------------------------------------------------------------------
   // 6. Report
   // ------------------------------------------------------------------
-  const double dur_s = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - t_warmup).count();
-
   std::printf("\n"
               "═══════════════════════════════════════════════════════════\n"
               " RESULT — %s   run_id=%s\n"
@@ -1972,7 +2013,6 @@ int main(int argc, char** argv) {
               "  • True wire overhead needs a packet capture; the figure above\n"
               "    counts application bytes only and cannot see retransmits.\n");
 
-  if (opt.protocol == "rtmp") bytes_wire = rtmp.wire_bytes();
   // NOT set for WebRTC on purpose. RTP headers, SRTP authentication tags and
   // SCTP framing all live below libdatachannel's frame API, so no wire figure is
   // observable here. media_bytes() counts depacketized payload — reporting it as
@@ -1986,6 +2026,7 @@ int main(int argc, char** argv) {
       ? srt_lost : (udp_protocol ? packets.missing() : tcp_retrans);
   log.WriteSummary(seq.received(), seq.gap_frames(), seq.reorder_events(),
                    seq.duplicates(), reassembly_failures, bytes_payload, bytes_wire,
+                   measurement_duration_ns,
                    have_after ? sync_after.offset_ns : 0, drift_ns,
                    clock_suspect || !have_after,
                    summary_packets_received, summary_packets_lost,

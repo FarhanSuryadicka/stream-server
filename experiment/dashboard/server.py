@@ -541,6 +541,15 @@ class DashboardState:
             return data
 
 
+def measurement_duration_s(summary: dict, frames: list[dict]) -> float:
+    duration = int(summary.get("measurement_duration_ns", 0)) / 1e9
+    if duration <= 0.0 and len(frames) > 1:
+        # Compatibility with logs written before the receiver recorded the
+        # actual measurement window in its summary.
+        duration = (int(frames[-1]["rcv_ns"]) - int(frames[0]["rcv_ns"])) / 1e9
+    return max(duration, 0.0)
+
+
 def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dict:
     meta: dict = {}
     summary: dict = {}
@@ -625,9 +634,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
                 "bytes": frame.get("bytes", 0),
             })
 
-    duration_s = 0.0
-    if len(frames) > 1:
-        duration_s = (int(frames[-1]["rcv_ns"]) - int(frames[0]["rcv_ns"])) / 1e9
+    duration_s = measurement_duration_s(summary, frames)
     payload = int(summary.get("bytes_payload", sum(int(f.get("bytes", 0)) for f in frames)))
     wire = int(summary.get("bytes_wire", payload))
     received = int(summary.get("frames_received", len(frames)))
@@ -670,6 +677,7 @@ def parse_run(path: Path, root: Path, labels: dict, include_series: bool) -> dic
         "clock_drift_ms": round(int(summary.get("clock_drift_ns", 0)) / 1e6, 3),
         "frames": len(frames),
         "frames_reported": received,
+        "measurement_duration_s": round(duration_s, 6),
         "fps": round(len(frames) / duration_s, 2) if duration_s > 0 else 0.0,
         "transport": {
             "p50": round(percentile(transport, 0.50), 3),
