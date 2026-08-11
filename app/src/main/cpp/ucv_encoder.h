@@ -101,9 +101,10 @@ typedef struct ucv_jpeg_decoder ucv_jpeg_decoder_t;
 ucv_jpeg_decoder_t *ucv_jpeg_decoder_create(int width, int height);
 void                ucv_jpeg_decoder_destroy(ucv_jpeg_decoder_t *d);
 
-/* Decodes a JPEG into the decoder's internal NV12 buffer. Returns 0 on
- * success; *out_nv12 / *out_size point at internal storage valid until the
- * next decode call. */
+/* Decodes a JPEG into the decoder's internal NV12 buffer. The decoder also
+ * retains its libjpeg state across calls, so create one per pipeline run rather
+ * than one per frame. Returns 0 on success; *out_nv12 / *out_size point at
+ * internal storage valid until the next decode call. */
 int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
                             size_t jpeg_size, const uint8_t **out_nv12,
                             size_t *out_size);

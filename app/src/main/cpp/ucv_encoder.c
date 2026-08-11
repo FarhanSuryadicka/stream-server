@@ -356,19 +356,26 @@ uint64_t ucv_encoder_drops(const ucv_encoder_t *e)      { return e ? e->drops : 
 /* MJPEG -> NV12                                                     */
 /* ================================================================ */
 
-struct ucv_jpeg_decoder {
-  int      width, height;
-  uint8_t *nv12;      /* Y plane, then interleaved UV (NV12 order) */
-  size_t   nv12_size;
-  uint8_t *rgb_row;   /* one scanline of RGB scratch */
-};
-
 /* libjpeg's default error handler calls exit() — unacceptable inside a
  * streaming server, where one corrupt frame must not take the process down.
  * longjmp back to the caller instead. */
 struct jpeg_err_ctx {
   struct jpeg_error_mgr pub;
   jmp_buf               jump;
+};
+
+struct ucv_jpeg_decoder {
+  int      width, height;
+  uint8_t *nv12;      /* Y plane, then interleaved UV (NV12 order) */
+  size_t   nv12_size;
+  uint8_t *rgb_row;   /* one scanline of YCbCr scratch */
+
+  /* Creating and destroying libjpeg's permanent pools for every camera frame
+   * is pure allocator overhead. This object is owned by the single capture
+   * thread, so one decompressor can safely serve the whole pipeline run. */
+  struct jpeg_decompress_struct cinfo;
+  struct jpeg_err_ctx           err;
+  int                           jpeg_created;
 };
 
 static void jpeg_error_exit_longjmp(j_common_ptr cinfo) {
@@ -402,12 +409,27 @@ ucv_jpeg_decoder_t *ucv_jpeg_decoder_create(int width, int height) {
     ucv_jpeg_decoder_destroy(d);
     return NULL;
   }
+
+  d->cinfo.err = jpeg_std_error(&d->err.pub);
+  d->err.pub.error_exit = jpeg_error_exit_longjmp;
+  d->err.pub.output_message = jpeg_output_message_silent;
+  if (setjmp(d->err.jump)) {
+    ELOGE_BOTH("jpeg decoder: libjpeg initialization failed");
+    ucv_jpeg_decoder_destroy(d);
+    return NULL;
+  }
+  d->jpeg_created = 1;
+  /* libjpeg documents jpeg_destroy() as safe even when create fails, so mark
+   * it before the call and let the longjmp cleanup path release partial state. */
+  jpeg_create_decompress(&d->cinfo);
   return d;
 }
 
 void ucv_jpeg_decoder_destroy(ucv_jpeg_decoder_t *d) {
   if (!d)
     return;
+  if (d->jpeg_created)
+    jpeg_destroy_decompress(&d->cinfo);
   free(d->nv12);
   free(d->rgb_row);
   free(d);
@@ -419,38 +441,33 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
   if (!d || !jpeg || !jpeg_size)
     return -1;
 
-  struct jpeg_decompress_struct cinfo;
-  struct jpeg_err_ctx err;
-
-  cinfo.err = jpeg_std_error(&err.pub);
-  err.pub.error_exit = jpeg_error_exit_longjmp;
-  err.pub.output_message = jpeg_output_message_silent;
-
-  if (setjmp(err.jump)) {
-    jpeg_destroy_decompress(&cinfo);
+  struct jpeg_decompress_struct *cinfo = &d->cinfo;
+  if (setjmp(d->err.jump)) {
+    /* jpeg_abort_decompress() is one of the two libjpeg calls documented as
+     * safe after error_exit. It releases per-image pools but preserves the
+     * reusable decompressor and its permanent allocations. */
+    jpeg_abort_decompress(cinfo);
     return -1; /* corrupt frame: caller counts it, stream keeps running */
   }
 
-  jpeg_create_decompress(&cinfo);
-  jpeg_mem_src(&cinfo, jpeg, (unsigned long)jpeg_size);
-  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-    jpeg_destroy_decompress(&cinfo);
+  jpeg_mem_src(cinfo, jpeg, (unsigned long)jpeg_size);
+  if (jpeg_read_header(cinfo, TRUE) != JPEG_HEADER_OK) {
+    jpeg_abort_decompress(cinfo);
     return -1;
   }
 
   /* Ask libjpeg for YCbCr directly: the encoder wants luma/chroma, so going
    * via RGB would mean two colour conversions per frame for nothing. */
-  cinfo.out_color_space = JCS_YCbCr;
-  cinfo.raw_data_out = FALSE;
-  jpeg_start_decompress(&cinfo);
+  cinfo->out_color_space = JCS_YCbCr;
+  cinfo->raw_data_out = FALSE;
+  jpeg_start_decompress(cinfo);
 
-  if ((int)cinfo.output_width != d->width ||
-      (int)cinfo.output_height != d->height) {
+  if ((int)cinfo->output_width != d->width ||
+      (int)cinfo->output_height != d->height) {
     ELOGE_BOTH("jpeg decoder: frame is %dx%d but decoder configured %dx%d",
-               (int)cinfo.output_width, (int)cinfo.output_height, d->width,
+               (int)cinfo->output_width, (int)cinfo->output_height, d->width,
                d->height);
-    jpeg_abort_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
+    jpeg_abort_decompress(cinfo);
     return -1;
   }
 
@@ -459,9 +476,9 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
   uint8_t *UV = d->nv12 + (size_t)w * h;
   JSAMPROW row = (JSAMPROW)d->rgb_row; /* 3 bytes/px: Y, Cb, Cr */
 
-  while ((int)cinfo.output_scanline < h) {
-    const int y = (int)cinfo.output_scanline;
-    if (jpeg_read_scanlines(&cinfo, &row, 1) != 1)
+  while ((int)cinfo->output_scanline < h) {
+    const int y = (int)cinfo->output_scanline;
+    if (jpeg_read_scanlines(cinfo, &row, 1) != 1)
       break;
 
     uint8_t *yrow = Y + (size_t)y * w;
@@ -486,8 +503,7 @@ int ucv_jpeg_decode_to_nv12(ucv_jpeg_decoder_t *d, const uint8_t *jpeg,
     }
   }
 
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
+  jpeg_finish_decompress(cinfo);
 
   *out_nv12 = d->nv12;
   *out_size = d->nv12_size;
