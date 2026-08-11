@@ -71,14 +71,28 @@ Android bersifat dinamis, jadi lihat kembali menu **Proses debug nirkabel**.
 |---|---|---|---|
 | Raw UDP H.264 | selesai | selesai | Sudah diuji HP → PC |
 | MJPEG/HTTP | selesai | selesai | Sudah diuji, preview web bekerja |
-| RTP/UDP H.264 | selesai | selesai | Data plane selesai; RTSP signalling belum |
+| RTP/UDP H.264 | selesai | selesai | Data plane selesai |
+| RTSP H.264 | selesai, smoke test lulus | selesai (memakai jalur RTP) | Belum diuji pada HP/kamera |
 | SRT H.264 | selesai dan build lulus | selesai dan build lulus | Belum diuji pada HP/kamera |
-| WebRTC | stub | belum | Belum diimplementasikan |
-| RTMPS | stub | belum | Belum diimplementasikan |
-| HLS/DASH | stub | belum | Belum diimplementasikan |
+| HLS | selesai, smoke test lulus | **reader PC belum ada** | Sender saja |
+| RTMP | selesai, smoke test lulus | **reader PC belum ada** | Sender saja; **plaintext, bukan RTMPS** |
+| WebRTC | stub (NULL) | belum | Terblokir: butuh vendoring DTLS/SRTP |
 
-Jangan menyebut RTP/UDP saat ini sebagai RTSP penuh. Belum ada RTSP
-`DESCRIBE`, `SETUP`, `PLAY`, atau SDP signalling.
+RTSP signalling sekarang sudah ada (`OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`/
+`TEARDOWN` + SDP) di `ucv_transport_rtsp.c`, HP sebagai server pada TCP 8554.
+Paket medianya identik dengan `rtp_udp`, jadi receiver memakai jalur RTP yang
+sama; protokol id `UCV_PROTO_RTSP_SIGNALLED` (8) dipakai agar run mencatat
+mana yang benar-benar dipakai.
+
+**RTMP di sini plaintext, bukan RTMPS.** Tidak ada TLS library yang divendor,
+jadi menamainya RTMPS akan mengklaim properti keamanan yang tidak ada.
+`transport->name` sengaja `"rtmp"`.
+
+**WebRTC masih NULL dan itu disengaja.** WebRTC mewajibkan DTLS-SRTP; tidak ada
+DTLS/SRTP/ICE/SCTP yang divendor (haicrypt milik SRT hanya shim di atas
+mbedTLS/OpenSSL, dan `ENABLE_ENCRYPTION` off). Mengirim RTP plaintext lalu
+melabelinya "webrtc" persis jenis mislabel yang harus dicegah. Perlu keputusan
+vendoring `libdatachannel` + crypto backend lebih dulu.
 
 ## 5. Pipeline Android
 
