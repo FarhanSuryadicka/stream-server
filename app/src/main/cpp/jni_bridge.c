@@ -6,6 +6,7 @@
 #include "ucv_transport.h"
 #include "ucv_control.h"
 #include "ucv_pipeline.h"
+#include "ucv_remote_start.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -757,24 +758,28 @@ static void stop_experiment_native(void) {
 
 static int remote_start(const char *peer_ip,
                         const ucv_start_run_payload_t *request) {
-  if (!request ||
-      (request->protocol_id != UCV_PROTO_RAWUDP &&
-       request->protocol_id != UCV_PROTO_SRT &&
-       request->protocol_id != UCV_PROTO_MJPEG &&
-       request->protocol_id != UCV_PROTO_RTSP) ||
+  if (!request || !peer_ip || !peer_ip[0] ||
       !request->width || !request->height || !request->fps)
     return -EINVAL;
+
+  if (!ucv_remote_start_supported(request->protocol_id)) {
+    LOGE("remote START rejected: unsupported proto=%u",
+         request->protocol_id);
+    return -EINVAL;
+  }
+
   stop_experiment_native();
+  const uint16_t default_port =
+      ucv_remote_default_port(request->protocol_id);
+  const uint16_t port = request->video_port ? request->video_port : default_port;
   char peer[64];
-  if (request->protocol_id == UCV_PROTO_MJPEG) {
-    snprintf(peer, sizeof(peer), "%u",
-             request->video_port ? request->video_port : UCV_PORT_MJPEG);
+  if (ucv_remote_config_is_port_only(request->protocol_id)) {
+    /* MJPEG is a server on the phone and its transport accepts a bare port. */
+    snprintf(peer, sizeof(peer), "%u", port);
   } else {
-    snprintf(peer, sizeof(peer), "%s:%u", peer_ip,
-             request->video_port ? request->video_port :
-             (request->protocol_id == UCV_PROTO_RTSP ? UCV_PORT_RTP :
-              request->protocol_id == UCV_PROTO_SRT ? UCV_PORT_SRT :
-                                                      UCV_PORT_RAWUDP));
+    /* Raw/RTP/SRT/RTMP/WebRTC use the peer address. HLS only consumes the port,
+     * but accepts this common host:port form and ignores the host component. */
+    snprintf(peer, sizeof(peer), "%s:%u", peer_ip, port);
   }
   LOGI("remote START: proto=%u %ux%u@%u cfg=%s", request->protocol_id,
        request->width, request->height, request->fps, peer);

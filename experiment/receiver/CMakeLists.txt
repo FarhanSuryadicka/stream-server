@@ -58,6 +58,7 @@ target_link_libraries(ucv-receiver PRIVATE srt_static datachannel-static)
 # from clock offset. Run it before trusting any measurement — a bug in these
 # does not crash, it silently produces plausible wrong numbers.
 add_executable(ucv-selftest src/selftest.cpp)
+target_include_directories(ucv-selftest PRIVATE ${UCV_CPP_DIR})
 
 # Phone stand-in that speaks the real wire protocol, so the whole measurement
 # path can be validated on one machine. Its numbers describe the loopback

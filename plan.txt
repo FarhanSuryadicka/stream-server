@@ -1,0 +1,173 @@
+Ya—dan berdasarkan hasil run yang sudah ada, bottleneck utamanya sekarang bukan Raw UDP, tetapi pipeline decode/encode dan antrean/burst sebelum data masuk jaringan.
+
+Contoh dari log aktual:
+
+- `640x480@60` Raw UDP hanya mencapai sekitar 43–45 FPS, dengan capture→encode p50 sekitar 26–29 ms.
+- `1920x1080@60` Raw UDP turun menjadi sekitar 4,2 FPS, capture→encode sekitar 257 ms.
+- `2592x1944@30` hanya sekitar 3,1 FPS, capture→encode sekitar 340 ms.
+- MJPEG passthrough `640x480@60` dapat mencapai 59,9 FPS.
+
+Artinya, mengoptimalkan UDP saja tidak akan banyak membantu resolusi tinggi sebelum jalur JPEG→NV12→H.264 diperbaiki.
+
+## Prioritas yang saya rekomendasikan
+
+| Prioritas | Perubahan | Dampak |
+|---|---|---|
+| P0 | Perbaiki reassembly dan metrik | Hasil eksperimen menjadi valid |
+| P1 | Optimalkan JPEG→NV12 | Kenaikan FPS terbesar |
+| P1 | Batasi antrean dan lakukan packet pacing | Turunkan p95/p99 latency |
+| P2 | Kurangi copy dan syscall transport | Turunkan penggunaan CPU |
+| P2 | Tuning RTP/SRT | Reliability dan efisiensi protokol |
+
+### 1. Perbaiki reassembly Raw UDP/SRT dahulu
+
+Receiver Raw UDP sekarang mengabaikan `fragment_index` dan menempelkan payload sesuai urutan paket datang di [main.cpp](/C:/Users/user/stream-server/experiment/receiver/src/main.cpp:148).
+
+Masalahnya:
+
+- UDP dapat reorder.
+- Fragmen duplikat ikut ditambahkan.
+- Fragmen terakhir yang datang lebih awal langsung dianggap frame pendek/gagal.
+- Hanya satu frame boleh terbuka pada satu waktu.
+
+Sebaiknya gunakan mekanisme seperti RTP reassembler:
+
+- Simpan fragmen berdasarkan `fragment_index`.
+- Abaikan duplikat.
+- Tunggu sampai seluruh indeks hadir.
+- Dukung beberapa frame in-flight dalam map kecil.
+- Hapus frame yang timeout, misalnya setelah 100–300 ms.
+
+Ini mungkin tidak menaikkan FPS, tetapi langsung memperbagus robustness protokol dan mencegah frame korup.
+
+### 2. Optimalkan JPEG→NV12
+
+Bagian terberat ada di [ucv_encoder.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_encoder.c:441). Saat ini decoder:
+
+1. Menghasilkan YCbCr interleaved 3 byte/pixel.
+2. Melakukan loop seluruh pixel untuk menyalin Y.
+3. Mengambil chroma dari pixel genap.
+4. Menyalin lagi seluruh NV12 ke MediaCodec di [ucv_encoder.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_encoder.c:252).
+
+Optimasi terbaik:
+
+- Gunakan `jpeg_read_raw_data()` atau TurboJPEG planar YUV.
+- Untuk JPEG 4:2:0, salin plane Y langsung lalu interleave Cb/Cr menjadi NV12.
+- Gunakan NEON untuk interleave UV.
+- Reuse `jpeg_decompress_struct` antar-frame, jangan create/destroy setiap frame.
+- Prealokasikan seluruh buffer.
+
+Ini menghilangkan upsample chroma, buffer YCbCr 3-byte/pixel, dan sebagian besar loop pixel. Ini kemungkinan perubahan dengan dampak FPS paling besar.
+
+Untuk jangka panjang, opsi terbaik adalah hardware JPEG decoder→surface→MediaCodec input surface, atau UVC H.264 passthrough jika kamera mendukung H.264. Namun implementasinya jauh lebih kompleks.
+
+### 3. Tambahkan bounded “latest-frame queue”
+
+Saat ini thread drain langsung memanggil transport. Jika TCP/SRT tersendat, output encoder ikut tertahan. Pada MJPEG lebih buruk lagi: pengiriman TCP blocking dilakukan langsung oleh capture thread di [ucv_transport_mjpeg.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_transport_mjpeg.c:183), dengan timeout sampai lima detik.
+
+Gunakan antrean terpisah:
+
+```text
+capture/decode/encode
+        ↓
+queue kapasitas 2–3 frame
+        ↓
+transport worker
+```
+
+Jika penuh, buang frame tertua—bukan menumpuk frame lama. Tambahkan counter `queue_drops`.
+
+Untuk aplikasi realtime, frame baru yang sedikit hilang lebih baik daripada video lengkap tetapi tertinggal ratusan milidetik.
+
+### 4. Lakukan packet pacing
+
+Raw UDP sekarang mengirim seluruh fragmen frame sekaligus dalam loop di [ucv_transport.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_transport.c:145). Keyframe besar dapat menghasilkan puluhan hingga ratusan datagram dalam satu burst.
+
+Hal ini cocok dengan hasil saat ini: p50 Raw UDP hanya sekitar 2–7 ms, tetapi p95 sering 39–109 ms walaupun packet loss tercatat nol.
+
+Gunakan token-bucket pacing:
+
+- Rate sekitar 1,2–1,5× bitrate video.
+- Izinkan burst kecil.
+- Jangan biarkan antrean melewati satu frame interval.
+- Drop frame jika sudah melewati deadline.
+
+Alternatif encoder yang bagus adalah periodic intra refresh agar keyframe besar tersebar ke beberapa frame.
+
+### 5. Kurangi copy dan syscall UDP/RTP
+
+Raw UDP menyalin setiap fragmen ke buffer stack sebelum `sendto()` di [ucv_transport.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_transport.c:135).
+
+Perbaikannya:
+
+- `connect()` socket UDP sekali.
+- Gunakan `sendmsg()` dengan dua `iovec`: header dan payload asli.
+- Hilangkan `memcpy()` payload per fragmen.
+- Opsional gunakan `sendmmsg()` dalam batch kecil, tetapi tetap kombinasikan dengan pacing.
+
+Ukuran payload juga dapat dibuat configurable:
+
+- Saat ini: 1200 byte.
+- Untuk LAN MTU 1500 tanpa VPN: payload frame 1400 byte masih menghasilkan UDP payload total 1456 byte termasuk header UCV.
+- Ini mengurangi jumlah fragmen sekitar 14%.
+
+Pertahankan profil 1200 untuk jaringan/VPN yang MTU-nya tidak pasti.
+
+### 6. Perbaiki RTP
+
+RTP saat ini membawa extension 64 byte pada setiap paket, ditambah header RTP 12 byte, dengan payload hanya 1100 byte di [ucv_transport_rtp.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_transport_rtp.c:25). Overhead aplikasinya sekitar 6,9% per paket.
+
+Yang dapat dilakukan:
+
+- Jangan mengulang seluruh header UCV 56 byte pada setiap paket.
+- Gunakan extension ringkas untuk `frame_seq`, `run_hash`, dan `t_sent`.
+- Metadata lengkap cukup pada fragmen pertama/terakhir.
+- RTP sequence, timestamp, marker, dan FU-A sudah menyediakan banyak informasi yang sekarang diduplikasi.
+- Naikkan payload menuju 1300–1380 byte setelah validasi MTU.
+- Tambahkan RTCP Receiver Report, NACK, dan PLI bila ingin RTP yang benar-benar robust.
+- Namai protokol `RTP/UDP`, bukan RTSP—implementasi saat ini memang belum memiliki `DESCRIBE/SETUP/PLAY`.
+
+RTP juga memindai frame H.264 dua kali dan melakukan dua copy pada FU-A; keduanya dapat disederhanakan dengan single-pass packetization dan `iovec`.
+
+### 7. Tuning SRT
+
+SRT saat ini memakai latency tetap 20 ms dan payload total 1256 byte di [ucv_transport_srt.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_transport_srt.c:57).
+
+Rekomendasi:
+
+- Naikkan total `SRTO_PAYLOADSIZE` ke 1456 dan isi video per message menjadi 1400 byte.
+- Set `SRTO_MAXBW=0`.
+- Set `SRTO_INPUTBW` sesuai bitrate encoder, misalnya sekitar `4.000.000 / 8 = 500.000 B/s`.
+- Pertahankan `SRTO_OHEADBW` sekitar 25–30%.
+- Jadikan latency profil: 20, 50, dan 100 ms. Latency 20 ms belum tentu cukup untuk retransmission Wi-Fi.
+- Jangan memanggil `srt_bstats()` untuk setiap fragmen seperti saat ini di [main.cpp](/C:/Users/user/stream-server/experiment/receiver/src/main.cpp:902). Sampling 5–10 kali/detik sudah cukup.
+
+### 8. Perbaiki SPS/PPS dan konfigurasi encoder
+
+SPS/PPS sekarang hanya ditambahkan ke keyframe pertama di [ucv_encoder.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_encoder.c:318). Jika keyframe awal hilang, receiver bisa gagal decode sampai stream dimulai ulang.
+
+Lebih robust:
+
+- Tambahkan SPS/PPS pada setiap IDR/keyframe.
+- Atau kirim parameter set secara periodik.
+
+Selain itu, H.264 Level 3.1 di-hardcode di [ucv_encoder.c](/C:/Users/user/stream-server/app/src/main/cpp/ucv_encoder.c:154). Level 3.1 cocok sampai sekitar 720p30, tetapi tidak cocok untuk 1080p60 atau 2592×1944. Pilih level berdasarkan resolusi/FPS atau biarkan encoder menegosiasikan level yang benar.
+
+### 9. Ada dua bug metrik yang harus dibereskan
+
+- `bytes_wire` dihitung sejak warmup, sedangkan `bytes_payload` baru dihitung setelah warmup di [main.cpp](/C:/Users/user/stream-server/experiment/receiver/src/main.cpp:917). Karena itu laporan overhead Raw UDP sekitar 22,8% terlalu tinggi; overhead header aktual mestinya mendekati 4,7% plus fragmen terakhir.
+- Timestamp MJPEG dibuat setelah parsing string dan copy payload di [main.cpp](/C:/Users/user/stream-server/experiment/receiver/src/main.cpp:466), sedangkan UDP timestamp dibuat segera setelah `recv()`. Ini membuat MJPEG terlihat lebih lambat secara tidak adil.
+
+Preview, parsing, logging NDJSON, dan pengambilan statistik sebaiknya dipindahkan dari receive loop ke worker terpisah. Receive thread hanya menerima, memberi timestamp, dan memasukkan data ke antrean.
+
+## Hal penting untuk eksperimen protokol
+
+MJPEG sekarang tidak melewati decode/encode, sedangkan Raw UDP/RTP/SRT membawa H.264. Jadi MJPEG versus Raw UDP bukan perbandingan “hanya protokol”; itu perbandingan dua pipeline end-to-end berbeda.
+
+Untuk eksperimen ilmiah:
+
+- Bandingkan Raw UDP, RTP, dan SRT menggunakan access unit H.264 yang sama.
+- Perlakukan MJPEG passthrough sebagai baseline produk terpisah.
+- Atau buat eksperimen kedua di mana TCP multipart, UDP, dan SRT semuanya membawa JPEG kamera yang sama.
+
+Kalau memilih satu paket pekerjaan pertama, saya akan mengerjakan: robust reassembly → perbaikan metrik/timestamp → direct planar JPEG-to-NV12 → bounded queue dan packet pacing. Itu memberi kombinasi terbaik antara hasil eksperimen yang valid, FPS lebih tinggi, dan p95/p99 latency lebih rendah.

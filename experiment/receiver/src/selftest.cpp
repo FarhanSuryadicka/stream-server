@@ -8,6 +8,7 @@
 
 #include "ucv_wire.h"
 #include "ucv_stats.h"
+#include "ucv_remote_start.h"
 
 #include <cstdio>
 #include <cstring>
@@ -234,6 +235,42 @@ static void TestRunIdHash() {
   CHECK(a == ucv_run_id_hash("20260811T140355Z-webrtc-01"), "hash is stable");
 }
 
+static void TestRemoteStartRouting() {
+  std::printf("\n[control] dashboard protocols route to Android transports\n");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_RAWUDP), "Raw UDP remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_SRT), "SRT remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_MJPEG), "MJPEG remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_RTSP), "bare RTP remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_HLS), "HLS remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_RTMPS), "RTMP remote START enabled");
+  CHECK(ucv_remote_start_supported(UCV_PROTO_WEBRTC), "WebRTC remote START enabled");
+  CHECK(!ucv_remote_start_supported(UCV_PROTO_RTSP_SIGNALLED),
+        "signalled RTSP stays disabled until the receiver performs SETUP/PLAY");
+  CHECK(!ucv_remote_start_supported(999), "unknown protocol rejected");
+
+  CHECK(ucv_remote_default_port(UCV_PROTO_RAWUDP) == UCV_PORT_RAWUDP,
+        "Raw UDP default port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_SRT) == UCV_PORT_SRT,
+        "SRT default port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_MJPEG) == UCV_PORT_MJPEG,
+        "MJPEG default port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_RTSP) == UCV_PORT_RTP,
+        "bare RTP default media port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_HLS) == UCV_PORT_HLS,
+        "HLS default HTTP port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_RTMPS) == UCV_PORT_RTMPS,
+        "RTMP default publish port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_WEBRTC) == UCV_PORT_SIGNAL,
+        "WebRTC default signalling port");
+  CHECK(ucv_remote_default_port(UCV_PROTO_RTSP_SIGNALLED) == UCV_PORT_RTSP,
+        "signalled RTSP default control port");
+  CHECK(ucv_remote_default_port(999) == 0, "unknown protocol has no port");
+  CHECK(ucv_remote_config_is_port_only(UCV_PROTO_MJPEG),
+        "MJPEG receives a bare listen port");
+  CHECK(!ucv_remote_config_is_port_only(UCV_PROTO_HLS),
+        "HLS accepts the common peer:port configuration");
+}
+
 int main() {
   std::printf("ucv measurement primitives — self test\n");
   std::printf("======================================\n");
@@ -245,6 +282,7 @@ int main() {
   TestSequenceTracking();
   TestJitter();
   TestRunIdHash();
+  TestRemoteStartRouting();
 
   std::printf("\n======================================\n");
   if (g_failures == 0) {
