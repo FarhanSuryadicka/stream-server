@@ -1,0 +1,22 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Protocol experiment: build output and measurement logs.
+# Logs from a real run SHOULD be committed alongside the report so anyone can
+# recompute the numbers (harness spec section 8) — commit those deliberately
+# with `git add -f`, rather than having every scratch run swept in.
+/experiment/receiver/build/
+/experiment/results/

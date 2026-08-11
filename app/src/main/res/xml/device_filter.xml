@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Best-effort auto-launch-on-attach match: class 14 = USB_CLASS_VIDEO.
+         Composite UVC cameras (camera+mic) often declare this only on one
+         interface, not the device descriptor this filter checks, so some
+         cameras won't trigger auto-launch — the app's own interface-level
+         scan (MainActivity.findUvcDevices) is what actually matters for
+         detection once the app is open. -->
+    <usb-device class="14" />
+</resources>

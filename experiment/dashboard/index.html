@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UVC Transport Lab</title>
+  <style>
+    :root {
+      --ink:#17211b; --muted:#66736b; --paper:#f2f4ec; --panel:#fffdf7;
+      --line:#d9ddd1; --green:#174f3b; --mint:#8dd5ad; --amber:#d7913d;
+      --red:#b44b4b; --blue:#397f91; --shadow:0 14px 40px rgba(25,48,36,.08);
+    }
+    *{box-sizing:border-box} body{margin:0;background:var(--paper);color:var(--ink);
+      font:14px/1.45 Inter,Segoe UI,system-ui,sans-serif}
+    header{background:var(--green);color:white;padding:26px clamp(18px,4vw,56px);
+      display:flex;justify-content:space-between;align-items:end;gap:20px}
+    header h1{font-size:clamp(24px,4vw,38px);margin:0;letter-spacing:-.04em}
+    header p{margin:4px 0 0;color:#cfe3d8} .badge{padding:7px 11px;border-radius:99px;
+      background:#ffffff18;border:1px solid #ffffff35;font:12px ui-monospace,monospace}
+    main{max-width:1500px;margin:auto;padding:22px;display:grid;gap:18px}
+    .grid{display:grid;grid-template-columns:minmax(300px,430px) 1fr;gap:18px}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+      box-shadow:var(--shadow);padding:18px;min-width:0}
+    h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;margin:0 0 14px;color:var(--green)}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    label{display:grid;gap:4px;color:var(--muted);font-size:12px}.wide{grid-column:1/-1}
+    input,select,button{font:inherit;border-radius:9px;border:1px solid var(--line);padding:9px 10px}
+    input,select{background:white;color:var(--ink);width:100%} button{cursor:pointer;background:var(--green);color:white;border:0;font-weight:650}
+    button.secondary{background:#e5ebe4;color:var(--green)}button.danger{background:var(--red)}button:disabled{opacity:.45;cursor:not-allowed}
+    .actions{display:flex;gap:8px;margin-top:12px}.hint{font-size:12px;color:var(--muted);margin:12px 0 0}
+    pre{height:240px;overflow:auto;margin:0;background:#111a15;color:#c7eed5;border-radius:11px;
+      padding:13px;font:12px/1.5 Consolas,ui-monospace,monospace;white-space:pre-wrap}
+    .cards{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px;margin-bottom:16px}
+    .card{border:1px solid var(--line);border-radius:12px;padding:12px;background:white}
+    .card span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+    .card strong{font-size:23px;letter-spacing:-.04em}.card small{color:var(--muted)}
+    canvas{width:100%;height:180px;background:white;border:1px solid var(--line);border-radius:12px}
+    .metric-charts{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:10px}.chart-box{min-width:0}.chart-box h3{margin:0 0 6px;font-size:12px;color:var(--muted)}
+    .legend{display:flex;gap:18px;color:var(--muted);font-size:12px;margin:8px 0 0}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+    .toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.toolbar h2{margin:0}
+    .table-wrap{overflow:auto;max-height:390px}table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}
+    th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:650}
+    th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}tbody tr{cursor:pointer}tbody tr:hover,tbody tr.active{background:#e8f2e9}
+    .ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}.unknown{color:var(--amber)}
+    .label-editor{display:flex;gap:8px;align-items:end;margin-top:12px}.label-editor label{max-width:180px}.label-editor button{height:38px}
+    .preview-wrap{position:relative;display:grid;place-items:center;min-height:260px;background:#101713;border-radius:12px;overflow:hidden}
+    .preview-wrap img{display:block;width:100%;max-height:70vh;object-fit:contain;min-height:260px}
+    .preview-note{position:absolute;left:12px;bottom:12px;padding:6px 9px;border-radius:8px;background:#07100dcc;color:#d8e9df;font-size:12px}
+    @media(max-width:1050px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(3,1fr)}.metric-charts{grid-template-columns:1fr}}
+    @media(max-width:620px){main{padding:10px}.cards{grid-template-columns:repeat(2,1fr)}.form-grid{grid-template-columns:1fr}header{align-items:start;flex-direction:column}}
+  </style>
+</head>
+<body>
+<header>
+  <div><h1>UVC Transport Lab</h1><p>Raw measurements, live receiver, resolution-aware comparisons.</p></div>
+  <div class="badge" id="resultsPath">loading results…</div>
+</header>
+<main>
+  <section class="grid">
+    <div class="panel">
+      <h2>Start measurement</h2>
+      <div class="form-grid">
+        <label>Phone IP<input id="phone" value="192.168.137.139"></label>
+        <label>Protocol<select id="protocol"><option>raw_udp</option></select></label>
+        <label class="wide">Run ID (optional)<input id="runId" placeholder="generated automatically when empty"></label>
+        <label>MJPEG resolution<select id="resolution"><option value="">Refresh camera modes first</option></select></label>
+        <input id="mode" type="hidden" value="">
+        <label>Duration (seconds)<input id="duration" type="number" value="60" min="10"></label>
+        <label>Warmup (seconds)<input id="warmup" type="number" value="5" min="0"></label>
+      </div>
+      <div class="actions"><button id="modesBtn" class="secondary">Refresh camera modes</button><button id="startBtn">Start measurement</button><button id="stopBtn" class="danger">Stop</button></div>
+      <p class="hint" id="modesState">Di HP cukup Open USB Camera. Website memilih mode dan menjalankan pipeline HP otomatis.</p>
+    </div>
+    <div class="panel"><div class="toolbar"><h2>Live console</h2><span id="sessionState" class="unknown">idle</span></div><pre id="console">No active session.</pre></div>
+  </section>
+
+  <section class="panel">
+    <div class="toolbar"><h2>Live camera preview</h2><span id="previewState" class="unknown">idle</span></div>
+    <div class="preview-wrap">
+      <img id="previewImage" src="/api/preview.mjpeg" alt="Live H.264 camera preview">
+      <span class="preview-note" id="previewNote">Preview muncul setelah Start measurement.</span>
+    </div>
+    <p class="hint">Preview didekode oleh FFmpeg di PC. Jalur ini hanya salinan lokal setelah frame diterima, sehingga tidak mengambil port UDP 8201 dari pengukur.</p>
+  </section>
+
+  <section class="panel">
+    <div class="toolbar"><h2 id="selectedTitle">Selected run</h2><span id="validity"></span></div>
+    <div class="cards">
+      <div class="card"><span>Transport p50</span><strong id="p50">—</strong><small> ms</small></div>
+      <div class="card"><span>Transport p95</span><strong id="p95">—</strong><small> ms</small></div>
+      <div class="card"><span>Transport p99</span><strong id="p99">—</strong><small> ms</small></div>
+      <div class="card"><span>Jitter</span><strong id="jitter">—</strong><small> ms</small></div>
+      <div class="card"><span>Observed loss</span><strong id="loss">—</strong><small> %</small></div>
+      <div class="card"><span>Goodput</span><strong id="goodput">—</strong><small> Mbps</small></div>
+    </div>
+    <div class="metric-charts">
+      <div class="chart-box"><h3>Network latency (ms)</h3><canvas id="latencyChart"></canvas></div>
+      <div class="chart-box"><h3>Running jitter (ms)</h3><canvas id="jitterChart"></canvas></div>
+      <div class="chart-box"><h3>Observed packet loss (%)</h3><canvas id="lossChart"></canvas></div>
+    </div>
+    <div class="label-editor">
+      <label>Mode label<input id="labelMode" placeholder="320x240@20"></label>
+      <label>Condition label<input id="labelCondition" placeholder="clean"></label>
+      <button id="saveLabel" class="secondary">Save label</button>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="panel"><div class="toolbar"><h2>Run history</h2><button id="refreshBtn" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Run</th><th>Mode</th><th>State</th><th>Frames</th><th>p50</th><th>p95</th><th>p99</th><th>Jitter</th><th>Loss</th></tr></thead><tbody id="runsBody"></tbody></table></div></div>
+    <div class="panel"><h2>Resolution comparison</h2><div class="table-wrap"><table><thead><tr><th>Mode / condition</th><th>Runs</th><th>p50 avg</th><th>p95 avg</th><th>p99 avg</th><th>Jitter avg</th><th>Loss avg</th><th>Goodput</th></tr></thead><tbody id="compareBody"></tbody></table></div><p class="hint">Perbandingan hanya memasukkan run valid. Gunakan ≥3 run per mode dan kondisi.</p></div>
+  </section>
+</main>
+<script>
+  const $=id=>document.getElementById(id); let runs=[], selectedFile=null, selectedRun=null, cameraResolutions=[];
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  async function api(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.statusText);return j}
+  async function post(url,data={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
+  function avg(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:0} const f=(n,d=2)=>Number(n||0).toFixed(d);
+
+  async function refreshRuns(){
+    const data=await api('/api/runs');runs=data.runs;$('resultsPath').textContent=data.results_dir;
+    $('runsBody').innerHTML=runs.map(r=>`<tr data-file="${esc(r.file)}" class="${r.file===selectedFile?'active':''}"><td>${esc(r.run_id)}</td><td>${esc(r.mode)}</td><td class="${r.valid?'ok':r.clock_status==='RUNNING'?'unknown':'bad'}">${esc(r.clock_status)}</td><td>${r.frames}</td><td>${f(r.transport.p50)}</td><td>${f(r.transport.p95)}</td><td>${f(r.transport.p99)}</td><td>${f(r.jitter_ms)}</td><td>${f(r.loss_pct,3)}%</td></tr>`).join('');
+    document.querySelectorAll('#runsBody tr').forEach(tr=>tr.onclick=()=>selectRun(tr.dataset.file));renderComparison();
+    if(!selectedFile&&runs.length)selectRun((runs.find(r=>r.valid)||runs[0]).file);
+  }
+  async function selectRun(file){selectedFile=file;selectedRun=await api('/api/run?file='+encodeURIComponent(file));
+    $('selectedTitle').textContent=`${selectedRun.run_id} · ${selectedRun.mode} · ${selectedRun.condition}`;
+    $('validity').textContent=selectedRun.valid?'VALID RUN':selectedRun.clock_status;$('validity').className=selectedRun.valid?'ok':'bad';
+    $('p50').textContent=f(selectedRun.transport.p50);$('p95').textContent=f(selectedRun.transport.p95);$('p99').textContent=f(selectedRun.transport.p99);
+    $('jitter').textContent=f(selectedRun.jitter_ms);$('loss').textContent=f(selectedRun.loss_pct,3);$('goodput').textContent=f(selectedRun.goodput_mbps);
+    $('labelMode').value=selectedRun.mode==='unknown'?'':selectedRun.mode;$('labelCondition').value=selectedRun.condition==='unspecified'?'':selectedRun.condition;
+    drawCharts(selectedRun.series||[]);document.querySelectorAll('#runsBody tr').forEach(tr=>tr.classList.toggle('active',tr.dataset.file===file));
+  }
+  function renderComparison(){const groups={};runs.filter(r=>r.valid).forEach(r=>{const k=`${r.mode} · ${r.condition}`;(groups[k]??=[]).push(r)});
+    $('compareBody').innerHTML=Object.entries(groups).sort().map(([k,a])=>`<tr><td>${esc(k)}</td><td>${a.length}</td><td>${f(avg(a.map(x=>x.transport.p50)))}</td><td>${f(avg(a.map(x=>x.transport.p95)))}</td><td>${f(avg(a.map(x=>x.transport.p99)))}</td><td>${f(avg(a.map(x=>x.jitter_ms)))}</td><td>${f(avg(a.map(x=>x.loss_pct)),3)}%</td><td>${f(avg(a.map(x=>x.goodput_mbps)))}</td></tr>`).join('')||'<tr><td colspan="8">No valid runs yet.</td></tr>'}
+  function drawMetric(id,series,key,color,floorMax,decimals){const c=$(id),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*ratio;c.height=h*ratio;const x=c.getContext('2d');x.scale(ratio,ratio);x.clearRect(0,0,w,h);x.fillStyle='#fff';x.fillRect(0,0,w,h);if(!series.length){x.fillStyle='#66736b';x.fillText('Menunggu frame...',16,26);return}const vals=series.map(p=>Number(p[key]||0)),max=Math.max(floorMax,...vals)*1.08,pad={l:43,r:12,t:12,b:24};x.strokeStyle='#e0e4dc';x.fillStyle='#66736b';x.font='10px Segoe UI';for(let i=0;i<=4;i++){const y=pad.t+(h-pad.t-pad.b)*i/4;x.beginPath();x.moveTo(pad.l,y);x.lineTo(w-pad.r,y);x.stroke();x.fillText((max*(1-i/4)).toFixed(decimals),4,y+3)}x.strokeStyle=color;x.lineWidth=1.7;x.beginPath();vals.forEach((v,i)=>{const px=pad.l+(w-pad.l-pad.r)*i/(vals.length-1||1),py=pad.t+(h-pad.t-pad.b)*(1-v/max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle='#66736b';x.fillText('frame ->',w-55,h-7)}
+  function drawCharts(series){drawMetric('latencyChart',series,'latency','#397f91',5,0);drawMetric('jitterChart',series,'jitter','#d7913d',1,1);drawMetric('lossChart',series,'loss','#b44b4b',.1,2)}
+  async function pollSession(){try{const s=await api('/api/session');$('sessionState').textContent=s.state;$('sessionState').className=s.state==='complete'?'ok':s.state==='failed'?'bad':'unknown';$('console').textContent=(s.output||[]).join('\n')||'No active session.';$('console').scrollTop=$('console').scrollHeight;$('startBtn').disabled=['starting','running'].includes(s.state);$('stopBtn').disabled=!['starting','running'].includes(s.state);const p=s.preview||{status:'idle'};$('previewState').textContent=p.status;$('previewState').className=p.status==='live'?'ok':p.status==='error'?'bad':'unknown';$('previewNote').textContent=p.error||({idle:'Preview muncul setelah receiver dijalankan.',waiting:'Menunggu frame H.264 dari HP...',live:'LIVE - H.264 -> MJPEG',stopped:'Run selesai - menampilkan frame terakhir'}[p.status]||p.status);if(s.run_id&&['starting','running'].includes(s.state))$('runId').value=s.run_id;if(s.state==='complete'&&pollSession.last!==s.exit_code+':'+s.run_id){pollSession.last=s.exit_code+':'+s.run_id;refreshRuns()}}catch(e){$('console').textContent=e.message}}
+  $('startBtn').onclick=async()=>{try{const s=await post('/api/start',{phone:$('phone').value,protocol:$('protocol').value,run_id:$('runId').value,mode:$('mode').value,condition:'clean',duration:+$('duration').value,warmup:+$('warmup').value});$('runId').value=s.run_id;selectedFile=`receiver-${s.run_id}.ndjson`;pollSession()}catch(e){alert(e.message)}};
+  function updateExactMode(){const item=cameraResolutions[+$('resolution').value],fps=item?.fps?.[0];$('mode').value=item&&fps?`${item.width}x${item.height}@${fps}`:'';if(item&&fps)$('modesState').textContent=`Selected: ${item.width} x ${item.height} - FPS auto (${fps}, tertinggi yang didukung kamera).`}
+  async function refreshModes(showError=true){const b=$('modesBtn');b.disabled=true;$('modesState').textContent='Membaca descriptor MJPEG dari kamera HP...';try{const data=await api('/api/modes?phone='+encodeURIComponent($('phone').value));cameraResolutions=data.resolutions;const preferredResolution=data.recommended.split('@')[0];$('resolution').innerHTML=cameraResolutions.map((m,i)=>`<option value="${i}" ${`${m.width}x${m.height}`===preferredResolution?'selected':''}>${m.width} x ${m.height}</option>`).join('');updateExactMode();}catch(e){cameraResolutions=[];$('resolution').innerHTML='<option value="">Camera agent unavailable</option>';$('mode').value='';$('modesState').textContent=e.message;if(showError)alert(e.message)}finally{b.disabled=false}}
+  $('resolution').onchange=updateExactMode;
+  $('modesBtn').onclick=()=>refreshModes(true);
+  $('stopBtn').onclick=()=>post('/api/stop').catch(e=>alert(e.message));$('refreshBtn').onclick=refreshRuns;
+  $('saveLabel').onclick=async()=>{if(!selectedFile)return;try{await post('/api/label',{file:selectedFile,mode:$('labelMode').value||'unknown',condition:$('labelCondition').value||'unspecified'});await refreshRuns();await selectRun(selectedFile)}catch(e){alert(e.message)}};
+  async function refreshActive(){if(!selectedFile)return;try{await selectRun(selectedFile)}catch(e){}}
+  addEventListener('resize',()=>selectedRun&&drawCharts(selectedRun.series||[]));refreshRuns();pollSession();setInterval(()=>{pollSession();refreshActive()},1000);setInterval(refreshRuns,5000);
+</script>
+</body>
+</html>
