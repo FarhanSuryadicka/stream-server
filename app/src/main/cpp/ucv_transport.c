@@ -228,6 +228,7 @@ ucv_transport_t *ucv_transport_get(ucv_protocol_t proto) {
     case UCV_PROTO_MJPEG:  return ucv_transport_mjpeg();
     case UCV_PROTO_SRT:    return ucv_transport_srt();
     case UCV_PROTO_RTSP:   return ucv_transport_rtsp();
+    case UCV_PROTO_RTSP_SIGNALLED: return ucv_transport_rtsp_signalled();
     case UCV_PROTO_WEBRTC: return ucv_transport_webrtc();
     case UCV_PROTO_RTMPS:  return ucv_transport_rtmps();
     case UCV_PROTO_HLS:    return ucv_transport_hls();
@@ -240,6 +241,7 @@ ucv_transport_t *ucv_transport_get(ucv_protocol_t proto) {
  * experiment/docs/03-implementation-plan.md. */
 __attribute__((weak)) ucv_transport_t *ucv_transport_srt(void)    { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_rtsp(void)   { return NULL; }
+__attribute__((weak)) ucv_transport_t *ucv_transport_rtsp_signalled(void) { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_webrtc(void) { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_rtmps(void)  { return NULL; }
 __attribute__((weak)) ucv_transport_t *ucv_transport_hls(void)    { return NULL; }

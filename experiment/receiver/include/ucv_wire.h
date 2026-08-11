@@ -57,6 +57,11 @@ typedef enum {
   UCV_PROTO_MJPEG  = 5,
   UCV_PROTO_RTMPS  = 6,
   UCV_PROTO_HLS    = 7,
+  /* RTSP with real signalling. It puts the SAME RTP packets on the wire as
+   * UCV_PROTO_RTSP (which is the bare RTP data plane started out-of-band), so
+   * receivers parse both identically — but a run must record which one carried
+   * it, or the results would credit signalling that never took place. */
+  UCV_PROTO_RTSP_SIGNALLED = 8,
 } ucv_protocol_t;
 
 /* ---------------------------------------------------------------- */

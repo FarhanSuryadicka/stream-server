@@ -80,6 +80,12 @@ ucv_transport_t *ucv_transport_mjpeg(void);
 ucv_transport_t *ucv_transport_rtp(void);
 ucv_transport_t *ucv_transport_srt(void);
 ucv_transport_t *ucv_transport_rtsp(void);
+/* RTSP with real signalling (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN) driving the
+ * same RTP data plane. Kept separate from ucv_transport_rtsp() above, which is
+ * the bare RTP sender started out-of-band through the control channel: the two
+ * carry identical packets, so they must stay distinguishable at the point a run
+ * is labelled or the results table would claim signalling that never happened. */
+ucv_transport_t *ucv_transport_rtsp_signalled(void);
 ucv_transport_t *ucv_transport_webrtc(void);
 ucv_transport_t *ucv_transport_rtmps(void);
 ucv_transport_t *ucv_transport_hls(void);
